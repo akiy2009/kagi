@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS clients (
     require_dpop          INTEGER NOT NULL DEFAULT 0,
     require_par           INTEGER NOT NULL DEFAULT 0,
     id_token_alg          TEXT NOT NULL DEFAULT 'ES256',
+    registration_token_hash TEXT,
+    backchannel_logout_uri TEXT,
+    backchannel_logout_session_required INTEGER NOT NULL DEFAULT 0,
     created_at            INTEGER NOT NULL
 );
 
@@ -111,6 +114,7 @@ CREATE TABLE IF NOT EXISTS auth_codes (
     acr             TEXT NOT NULL,
     dpop_jkt        TEXT,
     session_id      TEXT,
+    claims          TEXT,
     expires_at      INTEGER NOT NULL,
     created_at      INTEGER NOT NULL,
     consumed        INTEGER NOT NULL DEFAULT 0
@@ -127,6 +131,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     acr             TEXT NOT NULL,
     dpop_jkt        TEXT,
     session_id      TEXT,
+    claims          TEXT,
     issued_at       INTEGER NOT NULL,
     expires_at      INTEGER NOT NULL,
     rotated_to      TEXT,
@@ -134,6 +139,25 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_rt_family ON refresh_tokens(family_id);
 CREATE INDEX IF NOT EXISTS idx_rt_user ON refresh_tokens(user_id);
+
+-- RFC 8628 device authorization grants. Only hashes of the device code and
+-- the human-entered user code are stored.
+CREATE TABLE IF NOT EXISTS device_codes (
+    device_hash     TEXT PRIMARY KEY,
+    user_code_hash  TEXT NOT NULL UNIQUE,
+    client_id       TEXT NOT NULL,
+    scope           TEXT NOT NULL,
+    user_id         TEXT,
+    auth_time       INTEGER,
+    amr             TEXT NOT NULL DEFAULT '[]',
+    acr             TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    interval_secs   INTEGER NOT NULL,
+    last_polled_at  INTEGER NOT NULL DEFAULT 0,
+    expires_at      INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_expires ON device_codes(expires_at);
 
 CREATE TABLE IF NOT EXISTS access_tokens (
     jti         TEXT PRIMARY KEY,
@@ -940,6 +964,15 @@ impl Db {
             ("sessions", "user_agent", "TEXT"),
             ("sessions", "ip", "TEXT"),
             ("access_tokens", "session_id", "TEXT"),
+            ("clients", "registration_token_hash", "TEXT"),
+            ("clients", "backchannel_logout_uri", "TEXT"),
+            (
+                "clients",
+                "backchannel_logout_session_required",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("auth_codes", "claims", "TEXT"),
+            ("refresh_tokens", "claims", "TEXT"),
         ] {
             let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
             if let Err(e) = c.execute_batch(&sql) {
@@ -1021,6 +1054,10 @@ impl Db {
             c.execute(
                 "DELETE FROM assertion_replay WHERE expires_at < ?1",
                 params![now],
+            )?;
+            c.execute(
+                "DELETE FROM device_codes WHERE expires_at < ?1",
+                params![now - 3600],
             )?;
             c.execute(
                 "DELETE FROM rate_limits WHERE window_start < ?1",
@@ -1142,6 +1179,9 @@ pub struct Client {
     pub require_dpop: bool,
     pub require_par: bool,
     pub id_token_alg: String,
+    pub registration_token_hash: Option<String>,
+    pub backchannel_logout_uri: Option<String>,
+    pub backchannel_logout_session_required: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1187,6 +1227,7 @@ pub struct AuthCode {
     pub acr: String,
     pub dpop_jkt: Option<String>,
     pub session_id: Option<String>,
+    pub claims: Option<String>,
     pub expires_at: i64,
     pub consumed: bool,
 }
@@ -1204,10 +1245,29 @@ pub struct RefreshToken {
     pub acr: String,
     pub dpop_jkt: Option<String>,
     pub session_id: Option<String>,
+    pub claims: Option<String>,
     pub issued_at: i64,
     pub expires_at: i64,
     pub rotated_to: Option<String>,
     pub revoked: bool,
+}
+
+/// A pending or completed RFC 8628 device authorization grant.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct DeviceCode {
+    pub device_hash: String,
+    pub client_id: String,
+    pub scope: String,
+    pub user_id: Option<String>,
+    pub auth_time: Option<i64>,
+    pub amr: Vec<String>,
+    pub acr: Option<String>,
+    pub status: String,
+    pub interval_secs: i64,
+    pub last_polled_at: i64,
+    pub expires_at: i64,
+    pub created_at: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,6 +1306,11 @@ fn map_client(row: &Row) -> Result<Client> {
         require_dpop: row.get::<_, i64>("require_dpop")? != 0,
         require_par: row.get::<_, i64>("require_par")? != 0,
         id_token_alg: row.get("id_token_alg")?,
+        registration_token_hash: row.get("registration_token_hash")?,
+        backchannel_logout_uri: row.get("backchannel_logout_uri")?,
+        backchannel_logout_session_required: row
+            .get::<_, i64>("backchannel_logout_session_required")?
+            != 0,
     })
 }
 
@@ -1315,6 +1380,34 @@ pub fn load_client(c: &Connection, id: &str) -> anyhow::Result<Option<Client>> {
         map_client,
     )
     .optional()?)
+}
+
+/// Clients that hold a token for this user (optionally for one browser
+/// session) and have registered a back-channel logout endpoint. Used to send
+/// OIDC Back-Channel Logout tokens when a session ends.
+pub fn backchannel_clients_for_user(
+    c: &Connection,
+    user_id: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<Vec<Client>> {
+    let rows = match session_id {
+        Some(sid) => c.query_all(
+            "SELECT DISTINCT cl.* FROM clients cl
+             JOIN access_tokens a ON a.client_id = cl.id
+             WHERE a.user_id = ?1 AND a.session_id = ?2
+               AND cl.backchannel_logout_uri IS NOT NULL",
+            params![user_id, sid],
+        )?,
+        None => c.query_all(
+            "SELECT DISTINCT cl.* FROM clients cl
+             JOIN access_tokens a ON a.client_id = cl.id
+             WHERE a.user_id = ?1 AND cl.backchannel_logout_uri IS NOT NULL",
+            params![user_id],
+        )?,
+    };
+    rows.iter()
+        .map(|row| map_client(row).map_err(|error| anyhow::anyhow!(error.to_string())))
+        .collect()
 }
 
 /// Remember (or update) the scopes a user has approved for a client.
@@ -1657,6 +1750,7 @@ pub fn load_code(c: &Connection, code_hash: &str) -> anyhow::Result<Option<AuthC
                 acr: row.get("acr")?,
                 dpop_jkt: row.get("dpop_jkt")?,
                 session_id: row.get("session_id")?,
+                claims: row.get("claims")?,
                 expires_at: row.get("expires_at")?,
                 consumed: row.get::<_, i64>("consumed")? != 0,
             })
@@ -1681,6 +1775,7 @@ pub fn load_refresh(c: &Connection, token_hash: &str) -> anyhow::Result<Option<R
                 acr: row.get("acr")?,
                 dpop_jkt: row.get("dpop_jkt")?,
                 session_id: row.get("session_id")?,
+                claims: row.get("claims")?,
                 issued_at: row.get("issued_at")?,
                 expires_at: row.get("expires_at")?,
                 rotated_to: row.get("rotated_to")?,
@@ -1689,6 +1784,47 @@ pub fn load_refresh(c: &Connection, token_hash: &str) -> anyhow::Result<Option<R
         },
     )
     .optional()?)
+}
+
+/// Load a device grant by the SHA-256 of its device code.
+pub fn load_device(c: &Connection, device_hash: &str) -> anyhow::Result<Option<DeviceCode>> {
+    Ok(c.query_row(
+        "SELECT * FROM device_codes WHERE device_hash = ?1",
+        params![device_hash],
+        map_device,
+    )
+    .optional()?)
+}
+
+/// Resolve the human-entered user code. Expired grants are never returned.
+pub fn load_device_by_user_code(
+    c: &Connection,
+    user_code_hash: &str,
+) -> anyhow::Result<Option<DeviceCode>> {
+    Ok(c.query_row(
+        "SELECT * FROM device_codes WHERE user_code_hash = ?1 AND expires_at > ?2",
+        params![user_code_hash, crate::util::now()],
+        map_device,
+    )
+    .optional()?)
+}
+
+/// Return the authorization grant (if any) that a browser session established.
+fn map_device(row: &Row) -> Result<DeviceCode> {
+    Ok(DeviceCode {
+        device_hash: row.get("device_hash")?,
+        client_id: row.get("client_id")?,
+        scope: row.get("scope")?,
+        user_id: row.get("user_id")?,
+        auth_time: row.get("auth_time")?,
+        amr: json_strings(&row.get::<_, String>("amr")?),
+        acr: row.get("acr")?,
+        status: row.get("status")?,
+        interval_secs: row.get("interval_secs")?,
+        last_polled_at: row.get("last_polled_at")?,
+        expires_at: row.get("expires_at")?,
+        created_at: row.get("created_at")?,
+    })
 }
 
 pub fn credentials_for_user(c: &Connection, user_id: &str) -> anyhow::Result<Vec<Credential>> {
@@ -1738,7 +1874,11 @@ pub fn seed_demo_client(c: &Connection) -> anyhow::Result<()> {
                 "http://localhost:8080/demo/callback",
             ])?,
             "[]",
-            serde_json::to_string(&vec!["authorization_code", "refresh_token"])?,
+            serde_json::to_string(&vec![
+                "authorization_code",
+                "refresh_token",
+                "urn:ietf:params:oauth:grant-type:device_code"
+            ])?,
             serde_json::to_string(&vec!["openid", "profile", "email", "offline_access"])?,
             "none",
             crate::util::now(),

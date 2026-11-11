@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS clients (
     require_dpop              BIGINT NOT NULL DEFAULT 0,
     require_par               BIGINT NOT NULL DEFAULT 0,
     id_token_alg              TEXT NOT NULL DEFAULT 'ES256',
+    registration_token_hash   TEXT,
+    backchannel_logout_uri    TEXT,
+    backchannel_logout_session_required BIGINT NOT NULL DEFAULT 0,
     created_at                BIGINT NOT NULL
 );
 
@@ -97,6 +100,7 @@ CREATE TABLE IF NOT EXISTS auth_codes (
     acr             TEXT NOT NULL,
     dpop_jkt        TEXT,
     session_id      TEXT,
+    claims          TEXT,
     expires_at      BIGINT NOT NULL,
     created_at      BIGINT NOT NULL,
     consumed        BIGINT NOT NULL DEFAULT 0
@@ -113,6 +117,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     acr             TEXT NOT NULL,
     dpop_jkt        TEXT,
     session_id      TEXT,
+    claims          TEXT,
     issued_at       BIGINT NOT NULL,
     expires_at      BIGINT NOT NULL,
     rotated_to      TEXT,
@@ -120,6 +125,24 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 CREATE INDEX IF NOT EXISTS idx_rt_family ON refresh_tokens(family_id);
 CREATE INDEX IF NOT EXISTS idx_rt_user ON refresh_tokens(user_id);
+
+-- RFC 8628 device authorization grants. Only code hashes are stored.
+CREATE TABLE IF NOT EXISTS device_codes (
+    device_hash     TEXT PRIMARY KEY,
+    user_code_hash  TEXT NOT NULL UNIQUE,
+    client_id       TEXT NOT NULL,
+    scope           TEXT NOT NULL,
+    user_id         TEXT,
+    auth_time       BIGINT,
+    amr             TEXT NOT NULL DEFAULT '[]',
+    acr             TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    interval_secs   BIGINT NOT NULL,
+    last_polled_at  BIGINT NOT NULL DEFAULT 0,
+    expires_at      BIGINT NOT NULL,
+    created_at      BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_expires ON device_codes(expires_at);
 
 CREATE TABLE IF NOT EXISTS access_tokens (
     jti         TEXT PRIMARY KEY,
@@ -183,6 +206,11 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_seen_at BIGINT NOT NULL DEFAU
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_agent TEXT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS ip TEXT;
 ALTER TABLE access_tokens ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS registration_token_hash TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS backchannel_logout_uri TEXT;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS backchannel_logout_session_required BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE auth_codes ADD COLUMN IF NOT EXISTS claims TEXT;
+ALTER TABLE refresh_tokens ADD COLUMN IF NOT EXISTS claims TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_at_session ON access_tokens(session_id);
