@@ -68,8 +68,8 @@ For troubleshooting, configuration, and setup options, see the [Quickstart guide
 | Area | Capabilities |
 | --- | --- |
 | Authentication | Passkey-first WebAuthn registration and sign-in; discoverable credentials, conditional UI, `none` / `packed` self-attestation, signature-counter clone detection, BE/BS flags |
-| Authorization | Authorization Code flow, PKCE S256, state/nonce handling, consent, `prompt=none/login/consent`, remembered consent, `max_age`, RFC 9207 `iss` |
-| OAuth/OIDC | Discovery, JWKS, UserInfo, introspection, revocation, logout, dynamic client registration |
+| Authorization | Authorization Code flow, PKCE S256, state/nonce handling, consent, `prompt=none/login/consent`, remembered consent, `max_age`, RFC 9207 `iss`, OIDC `claims` request parameter |
+| OAuth/OIDC | Discovery, JWKS, UserInfo, introspection, revocation, logout, dynamic client registration (RFC 7591), client management (RFC 7592), Device Authorization Grant (RFC 8628), Back-Channel Logout 1.0 |
 | Advanced profiles | PAR (RFC 9126), DPoP (RFC 9449, `cnf.jkt` + `ath` + `jti` replay protection), JAR (RFC 9101), JARM (`response_mode=jwt/query.jwt/fragment.jwt`) |
 | Client authentication | `client_secret_basic`, `client_secret_post`, `private_key_jwt` (RS256/PS256/ES256/EdDSA) and public clients |
 | Tokens | ES256-signed JWT access tokens (`typ: at+jwt`), refresh-token rotation with reuse detection (family revocation), `at_hash`, `sid` |
@@ -78,7 +78,7 @@ For troubleshooting, configuration, and setup options, see the [Quickstart guide
 | Integration | Built-in demo RP and browser SDK at `/static/kagi.js`; CORS-controlled API |
 | Account console | Profile editing, passkey add/rename/delete, device (session) list with single/bulk sign-out, connected-app revocation, recovery codes, audit events, account deletion |
 | Operations | Rate limiting, audit log, `/healthz` and `/readyz` (with database probe), `/admin/stats`, start-up configuration validation |
-| Security controls | PKCE enforcement, exact redirect URI matching, Origin + `Sec-Fetch-Site` checks, CSRF tokens, CSP/HSTS/COOP/CORP/Permissions-Policy, HttpOnly + SameSite=Lax sessions, SHA-256 at rest for all tokens |
+| Security controls | PKCE enforcement, exact redirect URI matching, Origin + `Sec-Fetch-Site` checks, CSRF tokens, CSP/HSTS/COOP/CORP/Permissions-Policy, HttpOnly + SameSite=Lax sessions, SHA-256 at rest for all tokens, SSRF-resistant back-channel delivery |
 
 Feature presence does not imply full normative compliance with every RFC or certification profile. Confirm actual behavior against the exact commit and configuration you deploy.
 
@@ -97,6 +97,17 @@ After sign-in, `/` is a passkey-only account console.
 Recovery codes are the fallback when no passkey is available. `GET /recover` with a username and code issues a session with `amr=["pwd","otp"]`. A code is invalidated on use, and regenerating the set invalidates all previous codes. Set `KAGI_RECOVERY_ENABLED=0` to disable the feature entirely.
 
 State-changing browser POSTs are validated with `Origin` and `Sec-Fetch-Site`. OAuth protocol endpoints (`/par`, `/token`, ...) are exempt because RPs call them cross-origin; they are protected by OAuth/DPoP validation instead.
+
+## Device flow, client management, and logout notifications
+
+These endpoints are available when the client requests them; enabling a feature does not make a deployment certified for the corresponding specification.
+
+- **Device Authorization Grant (RFC 8628)**: `POST /device_authorization` returns a `device_code`, a short `user_code`, and a verification URI. The user opens `/device`, enters the code, and approves or denies the request. The device polls `/token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code` and handles `authorization_pending`, `slow_down`, `access_denied`, and `expired_token`. Only code hashes are stored, and user codes are rate-limited and single-use. Set `KAGI_DEVICE_TTL` and `KAGI_DEVICE_INTERVAL` to tune lifetime and polling.
+- **Client management (RFC 7592)**: registration returns `registration_access_token` and `registration_client_uri` once. Use that bearer token with `GET`, `PUT`, or `DELETE /register/{client_id}` to read, update, rotate the secret for, or delete the client. The token is stored only as a SHA-256 hash and is never shown again. Updates re-validate redirect URIs, scopes, grant types, JWKS material, and the back-channel logout URI.
+- **`claims` request parameter**: an RP can request specific ID Token and UserInfo claims, mark them essential, and constrain `acr`. Kagi validates the JSON, rejects unknown claim names and oversized values, enforces the granted scope, and returns an authorization error when an essential claim cannot be supplied. Only the claim names and essential flags are stored with the grant.
+- **Back-Channel Logout 1.0**: register `backchannel_logout_uri` (and optionally `backchannel_logout_session_required`) to receive a signed `logout_token` when a session ends through sign-out, session revocation, or account closure. Delivery refuses non-HTTPS destinations in production, private/link-local addresses, redirects, and credentials in URLs. Loopback HTTP is accepted only outside production for local development.
+
+See [Client integration](docs/CLIENT_INTEGRATION.md) for request examples and [Security policy](SECURITY.md) for operational guidance.
 
 ## Documentation
 
@@ -144,6 +155,7 @@ The most important values are:
 - `KAGI_SEED_DEMO`: enables the local demo RP; keep it disabled in production.
 - `KAGI_ADMIN_TOKEN` and `KAGI_REGISTRATION_TOKEN`: administrative and client-registration secrets; keep them in a secret manager.
 - `KAGI_RECOVERY_ENABLED`, `KAGI_MAX_PASSKEYS`, `KAGI_AUDIT_RETENTION_DAYS`: account-console policy.
+- `KAGI_DEVICE_TTL` and `KAGI_DEVICE_INTERVAL`: device-code lifetime and minimum polling interval in seconds.
 - `KAGI_CORS_ORIGINS`: exact HTTPS origins allowed to call the API; wildcards are rejected.
 - `KAGI_TRUST_PROXY`: trust the first `X-Forwarded-For` hop; only behind a proxy that overwrites the header.
 
@@ -191,6 +203,12 @@ python scripts/e2e_admin.py
 KAGI_SEED_DEMO=1 KAGI_DB=kagi-account.db \
 KAGI_RECOVERY_ENABLED=1 KAGI_ADMIN_TOKEN=test-admin cargo run
 python scripts/e2e_account.py
+
+# 4) Device flow, claims, client management and back-channel logout
+KAGI_SEED_DEMO=1 KAGI_DB=kagi-complete-e2e.db KAGI_DEVICE_INTERVAL=1 \
+KAGI_REGISTRATION_TOKEN=reg-secret cargo run
+KAGI_DB=kagi-complete-e2e.db KAGI_REGISTRATION_TOKEN=reg-secret \
+python scripts/e2e_complete_oidc.py
 ```
 
 | Script | Coverage |
@@ -200,10 +218,11 @@ python scripts/e2e_account.py
 | `e2e_webauthn.py` | Sign-up/sign-in with a software authenticator, origin/type/challenge validation, tampered signatures and counter rollback rejection |
 | `e2e_admin.py` | DCR with an initial access token, `private_key_jwt`, assertion replay/aud validation, JAR signature validation, key rotation, logout redirect validation |
 | `e2e_account.py` | Profile update, passkey add/rename/delete, multiple sessions and bulk revocation, consent revocation, recovery code generation and single use, cross-origin POST rejection, `/healthz`, `/admin/stats`, account deletion |
+| `e2e_complete_oidc.py` | Device authorization and polling states, `claims` validation and filtering, RFC 7592 client read/update/rotation/deletion, signed back-channel logout delivery |
 | `e2e_rate_limit.py` | Shared rate-limit counters across repeated requests |
 | `e2e_security_races.py` | Concurrent ceremony and refresh-token reuse races |
 
-`e2e_oidc.py` and `e2e_advanced.py` insert sessions directly into the database, so run them with the same `KAGI_DB` as the server. `e2e_account.py` expects `KAGI_SEED_DEMO=1`, `KAGI_RECOVERY_ENABLED=1` and `KAGI_ADMIN_TOKEN=test-admin`. The same scripts work against PostgreSQL/Supabase: only the server-side `KAGI_DATABASE_URL` changes.
+`e2e_oidc.py` and `e2e_advanced.py` insert sessions directly into the database, so run them with the same `KAGI_DB` as the server. `e2e_account.py` expects `KAGI_SEED_DEMO=1`, `KAGI_RECOVERY_ENABLED=1` and `KAGI_ADMIN_TOKEN=test-admin`. `e2e_complete_oidc.py` additionally needs `KAGI_REGISTRATION_TOKEN`; set `KAGI_DEVICE_INTERVAL=1` to keep the polling tests fast. The same scripts work against PostgreSQL/Supabase: only the server-side `KAGI_DATABASE_URL` changes.
 
 PAR returns `201 Created` as required by RFC 9126.
 
@@ -257,7 +276,7 @@ For DPoP, add a `DPoP: <proof>` header to `/par` and `/token`; `token_type` beco
 - **DPoP.** `typ=dpop+jwt`, non-secret `jwk`, and `htm`/`htu`/`iat`/`jti` are validated; `htu` is normalized against the issuer rather than proxy headers; `jti` is cached for replay protection; `dpop_jkt` is bound at code issuance and checked at exchange. Presenting a DPoP-bound token with `Bearer` (or the reverse) returns 401 per RFC 9449 §7.1.
 - **Consent.** Approved scopes are stored in `consents`. `prompt=none` resolves in the order: no session → `login_required`, no consent → `consent_required`, both present → issue a code. Newly requested scopes require re-consent.
 - **WebAuthn.** `residentKey: required`, `userVerification: required`; rpIdHash, UP/UV, origin and challenge are all verified; ES256 (DER), EdDSA and RS256 COSE keys are supported; a non-zero `signCount` that moves backwards is treated as a cloned authenticator.
-- **Known limits.** Single-node assumptions remain for in-process caches; `request_uri` only accepts `urn:ietf:params:oauth:request_uri:*` (no SSRF-prone HTTPS fetch); back-channel logout, CIBA and SD-JWT VC are not implemented.
+- **Known limits.** Single-node assumptions remain for in-process caches; `request_uri` only accepts `urn:ietf:params:oauth:request_uri:*` (no SSRF-prone HTTPS fetch); CIBA and SD-JWT VC are not implemented.
 
 For a deployment checklist, see [Deployment](docs/DEPLOYMENT.md). For security reports, follow [SECURITY.md](SECURITY.md).
 

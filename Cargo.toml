@@ -30,6 +30,8 @@ ring = "0.17.14"
 anyhow = "1"
 tower = "0.5"
 vercel_runtime = { version = "2.4", features = ["axum"] }
+# Outbound OIDC back-channel logout delivery. rustls-based, no OpenSSL.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [[bin]]
 name = "main"

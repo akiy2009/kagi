@@ -49,6 +49,8 @@ All values are seconds and must be positive, except idle TTL may be `0` to disab
 | `KAGI_REFRESH_TTL` | `2592000` | Refresh-token lifetime (30 days) |
 | `KAGI_ID_TTL` | `300` | ID-token lifetime (5 minutes) |
 | `KAGI_PAR_TTL` | `90` | PAR request URI lifetime |
+| `KAGI_DEVICE_TTL` | `600` | RFC 8628 device-code lifetime |
+| `KAGI_DEVICE_INTERVAL` | `5` | Minimum device polling interval in seconds; a too-fast poll returns `slow_down` and raises the interval by 5 |
 
 ## Example production baseline
 

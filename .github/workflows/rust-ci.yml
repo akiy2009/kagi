@@ -141,6 +141,76 @@ jobs:
             kill "$(cat /tmp/kagi-security-test.pid)" 2>/dev/null || true
           fi
 
+  oidc-complete-integration:
+    name: OIDC core, client management, device flow and logout tests
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install integration test dependencies
+        run: python -m pip install --disable-pip-version-check requests cryptography
+
+      - name: Build release server
+        run: cargo build --locked --release
+
+      - name: Run OIDC, admin, and complete feature suites
+        env:
+          KAGI_BIND: 127.0.0.1:8080
+          KAGI_ISSUER: http://localhost:8080
+          KAGI_SEED_DEMO: "1"
+          KAGI_ADMIN_TOKEN: test-admin
+          KAGI_REGISTRATION_TOKEN: reg-secret
+          KAGI_DEVICE_INTERVAL: "1"
+        run: |
+          set -euo pipefail
+
+          run_suite() {
+            local db="$1"
+            shift
+            rm -f "$db" "$db-shm" "$db-wal"
+            KAGI_DB="$db" ./target/release/kagi > "/tmp/$db.log" 2>&1 &
+            local pid=$!
+            for _ in $(seq 1 60); do
+              if curl --fail --silent http://localhost:8080/healthz >/dev/null; then
+                break
+              fi
+              if ! kill -0 "$pid" 2>/dev/null; then
+                cat "/tmp/$db.log"
+                exit 1
+              fi
+              sleep 1
+            done
+            KAGI_DB="$db" "$@"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            rm -f "$db" "$db-shm" "$db-wal"
+          }
+
+          run_suite kagi-oidc-e2e.db python scripts/e2e_oidc.py
+          run_suite kagi-admin-e2e.db python scripts/e2e_admin.py
+          run_suite kagi-complete-e2e.db python scripts/e2e_complete_oidc.py
+
+      - name: Show server logs on failure
+        if: failure()
+        run: |
+          for log in /tmp/kagi-*-e2e.db.log; do
+            [ -f "$log" ] && { echo "===== $log"; cat "$log"; }
+          done
+
   vercel-security-smoke:
     name: Vercel production security guardrails
     runs-on: ubuntu-latest

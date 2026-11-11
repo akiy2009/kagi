@@ -19,7 +19,7 @@ Vercel デプロイ用のガードレール検査も実行します。
 python scripts/check_vercel_security.py
 ```
 
-現時点でユニットテストは 27 件です。テストの追加・変更に応じて件数は増減します。
+現時点でユニットテストは 40 件です。テストの追加・変更に応じて件数は増減します。
 
 ## 2. Python テスト依存関係のインストール
 
@@ -43,6 +43,7 @@ KAGI_SEED_DEMO=1 \
 KAGI_ADMIN_TOKEN=test-admin \
 KAGI_REGISTRATION_TOKEN=reg-secret \
 KAGI_RECOVERY_ENABLED=1 \
+KAGI_DEVICE_INTERVAL=1 \
 KAGI_DB=kagi-e2e.db \
 cargo run --locked
 ```
@@ -53,10 +54,13 @@ cargo run --locked
 KAGI_DB=kagi-e2e.db python scripts/e2e_oidc.py
 KAGI_DB=kagi-e2e.db python scripts/e2e_advanced.py
 KAGI_DB=kagi-e2e.db python scripts/e2e_security_races.py
+KAGI_DB=kagi-e2e.db KAGI_REGISTRATION_TOKEN=reg-secret python scripts/e2e_complete_oidc.py
 python scripts/e2e_rate_limit.py
 python scripts/e2e_webauthn.py
 python scripts/e2e_admin.py
 ```
+
+スイートは 1 つずつ、新しいデータベースと起動し直したサーバーで実行してください。レート制限はプロセス単位で、Back-Channel Logout のテストはループバックの受信サーバーを立てるため、共有サーバーだと後の実行が不安定になります。`e2e_complete_oidc.py` はサーバーと同じ `KAGI_REGISTRATION_TOKEN` を必要とし、`KAGI_DEVICE_INTERVAL=1` にするとポーリングテストが短時間で終わります。
 
 アカウント系は登録トークンを無効にした状態を想定します。
 
@@ -82,6 +86,7 @@ python scripts/e2e_account.py
 | `e2e_webauthn.py` | ソフトウェア認証器によるパスキー登録 / サインイン、challenge / origin / type 検証、署名改ざん・カウンタ巻き戻しの拒否 |
 | `e2e_admin.py` | 動的登録のゲート、`private_key_jwt`、JAR、鍵ローテーション、ログアウトリダイレクト検証、危険な redirect URI / 秘密 JWK / 不正 post-logout URI の拒否 |
 | `e2e_account.py` | プロフィール更新、パスキー追加 / 名前変更 / 削除、複数セッションと一括失効、同意取消、リカバリーコード生成と単回使用、クロスオリジン POST 拒否、`/healthz`、`/admin/stats`、アカウント削除 |
+| `e2e_complete_oidc.py` | RFC 8628 デバイス認可（承認・拒否・ポーリング・`slow_down`）、`claims` の検証とトークン / UserInfo のフィルタリング、RFC 7592 クライアント管理とシークレットローテーション、署名済み Back-Channel Logout の配信 |
 | `e2e_security_races.py` | 同時認可コード交換、同時 DPoP 証明リプレイ、鍵ローテーション / JWKS の重複期間、Discovery メタデータ、同時同意でコードが 1 個だけ発行されること、`acr_values` の強制 |
 | `e2e_rate_limit.py` | 共有固定ウィンドウレート制限と HTTP 429 / `Retry-After` |
 

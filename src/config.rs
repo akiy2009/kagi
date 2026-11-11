@@ -56,6 +56,10 @@ pub struct Config {
     pub id_ttl: i64,
     /// PAR request_uri lifetime in seconds (RFC 9126 recommends <= 600).
     pub par_ttl: i64,
+    /// RFC 8628 device-code lifetime in seconds.
+    pub device_ttl: i64,
+    /// Minimum polling interval advertised to device clients.
+    pub device_interval: i64,
 }
 
 fn flag(name: &str, default: bool) -> bool {
@@ -183,6 +187,8 @@ impl Config {
         let refresh_ttl = num("KAGI_REFRESH_TTL", 30 * 24 * 3600);
         let id_ttl = num("KAGI_ID_TTL", 300);
         let par_ttl = num("KAGI_PAR_TTL", 90);
+        let device_ttl = num("KAGI_DEVICE_TTL", 600);
+        let device_interval = num("KAGI_DEVICE_INTERVAL", 5);
         let cors_origins: Vec<String> = non_empty("KAGI_CORS_ORIGINS")
             .map(|raw| {
                 raw.split(',')
@@ -214,6 +220,8 @@ impl Config {
             ("KAGI_REFRESH_TTL", refresh_ttl),
             ("KAGI_ID_TTL", id_ttl),
             ("KAGI_PAR_TTL", par_ttl),
+            ("KAGI_DEVICE_TTL", device_ttl),
+            ("KAGI_DEVICE_INTERVAL", device_interval),
         ] {
             anyhow::ensure!(value > 0, "{name} must be greater than zero");
         }
@@ -250,6 +258,8 @@ impl Config {
             refresh_ttl,
             id_ttl,
             par_ttl,
+            device_ttl,
+            device_interval,
             rp_id,
             origin,
             issuer,
@@ -389,6 +399,8 @@ mod origin_tests {
                 refresh_ttl: 3600,
                 id_ttl: 300,
                 par_ttl: 90,
+                device_ttl: 600,
+                device_interval: 5,
             };
             assert!(config.is_local(), "did not detect local issuer host: {host}");
         }

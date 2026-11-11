@@ -101,9 +101,84 @@ curl --fail 'https://id.example.com/jwks.json'
 | `code_challenge_methods_supported` | `S256` のみ |
 | `acr_values_supported` | `urn:kagi:acr:passkey` / `urn:kagi:acr:recovery` |
 | `prompt_values_supported` | `none` / `login` / `consent` / `select_account` |
-| `claims_parameter_supported` | `false`（`claims` パラメーターは未実装） |
+| `device_authorization_endpoint` | RFC 8628 デバイス認可エンドポイント |
+| `backchannel_logout_supported` / `backchannel_logout_session_supported` | Back-Channel Logout 対応 |
+| `claims_parameter_supported` | `true`（対応クレームは後述） |
 
-## 4. 認可リクエストの例
+## 4. 任意の OIDC 機能
+
+以下は実装済みですが任意機能です。利用する前に、デプロイするコミットと設定で実際にどう動くかを確認してください。機能があること自体は、規範への適合や認証を意味しません。
+
+### 特定のクレームを要求する（`claims` パラメーター）
+
+標準の `claims` パラメーターに JSON を渡します。対応するのは `sub`、`auth_time`、`acr`、`amr`、`sid`、`name`、`preferred_username`、`email`、`email_verified`、`iss` です。未知の名前、過大な値、`acr` 以外への `value` / `values` は拒否されます。スコープが外側の境界であり、付与されていないスコープの必須クレームを要求した場合は、不完全なトークンを返さず認可エラーになります。
+
+```json
+{
+  "id_token": { "email": { "essential": true } },
+  "userinfo": { "name": null }
+}
+```
+
+`userinfo` を指定した場合、UserInfo はそこに列挙したクレームだけを返します。`email_verified` が必要なら明示的に要求してください。
+
+### デバイス認可グラント（RFC 8628）
+
+テレビ、CLI など入力が難しい端末向けです。クライアントの `grant_types` に `urn:ietf:params:oauth:grant-type:device_code` を含めて登録します。
+
+```bash
+curl --fail-with-body 'https://id.example.com/device_authorization' \
+  --data-urlencode 'client_id=YOUR_CLIENT_ID' \
+  --data-urlencode 'scope=openid profile offline_access'
+# -> device_code, user_code, verification_uri, expires_in, interval
+
+curl --fail-with-body 'https://id.example.com/token' \
+  --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:device_code' \
+  --data-urlencode 'device_code=DEVICE_CODE' \
+  --data-urlencode 'client_id=YOUR_CLIENT_ID'
+```
+
+利用者には `user_code` と `verification_uri` を表示します。ポーリングは `interval` 秒以上あけ、`authorization_pending` と `slow_down` を処理します（`slow_down` 後は 5 秒延ばす）。コードは 1 回限りで、`KAGI_DEVICE_TTL`（既定 600 秒）で失効します。
+
+### クライアント管理（RFC 7592）
+
+登録レスポンスには `registration_access_token` と `registration_client_uri` が含まれます。トークンは一度しか表示されず、サーバーにはハッシュだけが保存されるため、秘密として保管してください。
+
+```bash
+export REGISTRATION_ACCESS_TOKEN='登録レスポンスの値'
+
+curl --fail-with-body 'https://id.example.com/register/CLIENT_ID' \
+  --header "Authorization: Bearer $REGISTRATION_ACCESS_TOKEN"
+
+curl --fail-with-body --request PUT 'https://id.example.com/register/CLIENT_ID' \
+  --header "Authorization: Bearer $REGISTRATION_ACCESS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{"redirect_uris":["https://app.example.com/auth/callback"],
+           "backchannel_logout_uri":"https://app.example.com/oidc/logout"}'
+
+# クライアントシークレットをローテーションする（新しい値は一度だけ返る）
+curl --fail-with-body --request PUT 'https://id.example.com/register/CLIENT_ID' \
+  --header "Authorization: Bearer $REGISTRATION_ACCESS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{"rotate_client_secret":true,
+           "redirect_uris":["https://app.example.com/auth/callback"]}'
+
+curl --fail-with-body --request DELETE 'https://id.example.com/register/CLIENT_ID' \
+  --header "Authorization: Bearer $REGISTRATION_ACCESS_TOKEN"
+```
+
+削除すると、そのクライアントのトークン、同意、デバイスグラント、保留中のフローも削除されます。更新のたびに redirect URI、スコープ、グラント種別、JWKS、Back-Channel URI が再検証されます。
+
+### Back-Channel Logout 1.0
+
+登録時または管理更新で `backchannel_logout_uri` を登録します。ブラウザーセッションが終了すると（サインアウト、セッション失効、アカウント削除）、Kagi は署名済みの `logout_token` を `application/x-www-form-urlencoded` で POST します。
+
+- `iss`、`aud`、`iat`、`jti`、`sub`、および `http://schemas.openid.net/event/backchannel-logout` を含む `events` を検証します。
+- 現在の JWKS で署名を検証し、`jti` の再利用を拒否します。
+- `backchannel_logout_session_required` が true の場合、トークンには `sid` が含まれるため RP のセッションと照合します。
+- 配信はベストエフォートです。Kagi はリダイレクト、URL 内の資格情報、本番での非 HTTPS、プライベート / リンクローカルアドレスを拒否します。ループバック HTTP はローカル開発時のみ許可されます。
+
+## 5. 認可リクエストの例
 
 ```text
 GET https://id.example.com/authorize?
@@ -121,7 +196,7 @@ PAR を使う場合は、まず `POST /par` に同じパラメーターを送り
 
 DPoP を使う場合は、`/par` と `/token` の両方に `DPoP` ヘッダーで証明を付けます。トークン応答の `token_type` は `DPoP` になり、`/userinfo` では `ath`（アクセストークンのハッシュ）を含む証明が必要です。
 
-## 5. リダイレクトとトークンの安全性
+## 6. リダイレクトとトークンの安全性
 
 - redirect URI は完全一致で登録し、ワイルドカードを使わない。
 - Authorization Code + PKCE（S256）を使い、Implicit フローを使わない。

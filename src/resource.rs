@@ -8,7 +8,7 @@ use crate::jose;
 use crate::oidc;
 use crate::util::*;
 use crate::AppState;
-use axum::extract::{Form, State};
+use axum::extract::{Form, Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
@@ -136,13 +136,42 @@ fn userinfo_inner(st: &AppState, method: &Method, headers: &HeaderMap) -> ApiRes
         .ok_or_else(|| OauthError::unauthorized("unknown subject"))?;
 
     let mut out = json!({ "sub": user.id });
-    if oidc::scope_contains(scope, "profile") {
-        out["name"] = json!(user.display_name);
-        out["preferred_username"] = json!(user.username);
-    }
-    if oidc::scope_contains(scope, "email") {
-        out["email"] = json!(user.email);
-        out["email_verified"] = json!(user.email_verified);
+    let requested = claims
+        .get("kagi_claims")
+        .and_then(|value| value.get("userinfo"))
+        .and_then(Value::as_object);
+    let profile_allowed = oidc::scope_contains(scope, "profile");
+    let email_allowed = oidc::scope_contains(scope, "email");
+    if let Some(requested) = requested {
+        // The RP explicitly named the UserInfo claims it wants. Scope is still
+        // enforced: a claims request can never widen the original grant.
+        for claim in requested.keys() {
+            match claim.as_str() {
+                "name" if profile_allowed => out["name"] = json!(user.display_name),
+                "preferred_username" if profile_allowed => {
+                    out["preferred_username"] = json!(user.username)
+                }
+                "email" if email_allowed => {
+                    if let Some(email) = &user.email {
+                        out["email"] = json!(email);
+                        out["email_verified"] = json!(user.email_verified);
+                    }
+                }
+                "email_verified" if email_allowed && user.email.is_some() => {
+                    out["email_verified"] = json!(user.email_verified)
+                }
+                _ => {}
+            }
+        }
+    } else {
+        if profile_allowed {
+            out["name"] = json!(user.display_name);
+            out["preferred_username"] = json!(user.username);
+        }
+        if email_allowed {
+            out["email"] = json!(user.email);
+            out["email_verified"] = json!(user.email_verified);
+        }
     }
     if let Some(sid) = claims.get("sid").and_then(Value::as_str) {
         out["sid"] = json!(sid);
@@ -377,6 +406,371 @@ fn end_session(st: &AppState, headers: &HeaderMap, params: &HashMap<String, Stri
 // Dynamic client registration (RFC 7591)
 // ---------------------------------------------------------------------------
 
+/// Scopes kagi can actually issue. Dynamic registration must not be able to
+/// create a client with a scope that no endpoint understands: that would make
+/// consent screens and authorization decisions misleading.
+const REGISTERABLE_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
+
+fn validate_registerable_scopes(scopes: &[String]) -> ApiResult<()> {
+    for scope in scopes {
+        if !REGISTERABLE_SCOPES.iter().any(|allowed| allowed == scope) {
+            return Err(OauthError::invalid_scope(format!(
+                "scope {scope} is not supported"
+            )));
+        }
+    }
+    if !scopes.iter().any(|scope| scope == "openid") {
+        return Err(OauthError::invalid_scope("openid is required"));
+    }
+    Ok(())
+}
+
+fn parse_optional_uri(value: Option<&Value>, field: &str) -> ApiResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(raw) = value.as_str() else {
+        return Err(OauthError::invalid_request(format!(
+            "{field} must be a string"
+        )));
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    validate_redirect_uri(raw).map_err(|reason| {
+        OauthError::invalid_request(format!("{field} is invalid: {reason}"))
+    })?;
+    Ok(Some(raw.to_string()))
+}
+
+fn string_array(body: &Value, field: &str) -> Vec<String> {
+    body.get(field)
+        .and_then(Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn validate_redirect_list(uris: &[String], field: &str) -> ApiResult<()> {
+    if uris.is_empty() {
+        return Err(OauthError::invalid_request(format!("{field} is required")));
+    }
+    if uris.len() > 16 {
+        return Err(OauthError::invalid_request(format!(
+            "{field} must contain at most 16 entries"
+        )));
+    }
+    for uri in uris {
+        validate_redirect_uri(uri).map_err(|reason| {
+            OauthError::invalid_request(format!("{field} entry {uri} is invalid: {reason}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_client_name(body: &Value) -> ApiResult<String> {
+    let name = body
+        .get("client_name")
+        .and_then(Value::as_str)
+        .unwrap_or("dynamic client")
+        .trim()
+        .to_string();
+    if name.is_empty() || name.chars().count() > 120 || name.chars().any(char::is_control) {
+        return Err(OauthError::invalid_request(
+            "client_name must be 1–120 printable characters",
+        ));
+    }
+    Ok(name)
+}
+
+fn client_metadata_json(client: &Client, secret: Option<&str>) -> Value {
+    let mut response = json!({
+        "client_id": client.id,
+        "client_name": client.name,
+        "redirect_uris": client.redirect_uris,
+        "post_logout_redirect_uris": client.post_logout_redirect_uris,
+        "grant_types": client.grant_types,
+        "response_types": ["code"],
+        "token_endpoint_auth_method": client.auth_method,
+        "scope": client.scopes.join(" "),
+        "require_dpop": client.require_dpop,
+        "require_pushed_authorization_requests": client.require_par,
+        "id_token_signed_response_alg": client.id_token_alg,
+        "backchannel_logout_session_required": client.backchannel_logout_session_required,
+    });
+    if let Some(jwks) = &client.jwks {
+        response["jwks"] = jwks.clone();
+    }
+    if let Some(uri) = &client.backchannel_logout_uri {
+        response["backchannel_logout_uri"] = json!(uri);
+    }
+    if let Some(secret) = secret {
+        response["client_secret"] = json!(secret);
+        response["client_secret_expires_at"] = json!(0);
+    }
+    response
+}
+
+/// Authenticate an RFC 7592 management request with the registration access
+/// token issued at registration time.
+fn authenticate_registration_client(
+    st: &AppState,
+    headers: &HeaderMap,
+    client_id: &str,
+) -> ApiResult<Client> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OauthError::unauthorized("a registration access token is required")
+                .with_challenge("Bearer")
+        })?;
+
+    let client = st
+        .db
+        .with(|c| db::load_client(c, client_id))?
+        .ok_or_else(|| OauthError::unauthorized("invalid registration access token"))?;
+
+    let Some(expected) = client.registration_token_hash.as_deref() else {
+        return Err(OauthError::unauthorized(
+            "this client has no registration access token",
+        ));
+    };
+    if !ct_eq(&sha256_hex(token), expected) {
+        return Err(OauthError::unauthorized(
+            "invalid registration access token",
+        ));
+    }
+    Ok(client)
+}
+
+pub async fn client_info(
+    State(st): State<AppState>,
+    Path(client_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let result: ApiResult<Response> = (|| {
+        let client = authenticate_registration_client(&st, &headers, &client_id)?;
+        Ok(Json(client_metadata_json(&client, None)).into_response())
+    })();
+    match result {
+        Ok(mut res) => {
+            res.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            res
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+pub async fn update_client(
+    State(st): State<AppState>,
+    Path(client_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    match update_client_inner(&st, &client_id, &headers, &body) {
+        Ok(res) => res,
+        Err(error) => error.into_response(),
+    }
+}
+
+fn update_client_inner(
+    st: &AppState,
+    client_id: &str,
+    headers: &HeaderMap,
+    body: &Value,
+) -> ApiResult<Response> {
+    let existing = authenticate_registration_client(st, headers, client_id)?;
+
+    let redirect_uris = string_array(body, "redirect_uris");
+    validate_redirect_list(&redirect_uris, "redirect_uris")?;
+
+    let post_logout = string_array(body, "post_logout_redirect_uris");
+    for uri in &post_logout {
+        validate_redirect_uri(uri).map_err(|reason| {
+            OauthError::invalid_request(format!(
+                "post_logout_redirect_uri {uri} is invalid: {reason}"
+            ))
+        })?;
+    }
+
+    let auth_method = body
+        .get("token_endpoint_auth_method")
+        .and_then(Value::as_str)
+        .unwrap_or(&existing.auth_method)
+        .to_string();
+    if !matches!(
+        auth_method.as_str(),
+        "none" | "client_secret_basic" | "client_secret_post" | "private_key_jwt"
+    ) {
+        return Err(OauthError::invalid_request(
+            "unsupported token_endpoint_auth_method",
+        ));
+    }
+
+    let jwks = match body.get("jwks") {
+        Some(value) if !value.is_null() => {
+            validate_jwks(value)
+                .map_err(|reason| OauthError::invalid_request(format!("invalid jwks: {reason}")))?;
+            Some(value.to_string())
+        }
+        _ => None,
+    };
+    if auth_method == "private_key_jwt" && jwks.is_none() {
+        return Err(OauthError::invalid_request(
+            "private_key_jwt requires an inline jwks",
+        ));
+    }
+
+    let grant_types = match body.get("grant_types") {
+        Some(_) => string_array(body, "grant_types"),
+        None => existing.grant_types.clone(),
+    };
+    if grant_types.is_empty()
+        || grant_types.iter().any(|grant| {
+            !matches!(
+                grant.as_str(),
+                "authorization_code"
+                    | "refresh_token"
+                    | "client_credentials"
+                    | "urn:ietf:params:oauth:grant-type:device_code"
+            )
+        })
+    {
+        return Err(OauthError::invalid_request("unsupported grant type"));
+    }
+    if body.get("response_types").is_some() {
+        let response_types = string_array(body, "response_types");
+        if response_types.is_empty() || response_types.iter().any(|value| value != "code") {
+            return Err(OauthError::invalid_request(
+                "only response_type=code is supported",
+            ));
+        }
+    }
+
+    let scopes = match body.get("scope") {
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| OauthError::invalid_request("scope must be a string"))?;
+            oidc::split_scope(raw)
+        }
+        None => existing.scopes.clone(),
+    };
+    validate_registerable_scopes(&scopes)?;
+
+    let name = validate_client_name(body)?;
+    let backchannel_logout_uri =
+        parse_optional_uri(body.get("backchannel_logout_uri"), "backchannel_logout_uri")?;
+    let backchannel_required = body
+        .get("backchannel_logout_session_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(existing.backchannel_logout_session_required);
+
+    // RFC 7592 §2.2: the server may rotate the secret. Rotate when explicitly
+    // requested, or when the client moves to a secret-based method for the
+    // first time. Never silently keep returning a secret the client cannot see.
+    let rotate = body
+        .get("rotate_client_secret")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let secret_needed = auth_method.starts_with("client_secret");
+    let new_secret = if secret_needed
+        && (rotate || existing.secret_hash.is_none() || !existing.auth_method.starts_with("client_secret"))
+    {
+        Some(random_token(32))
+    } else {
+        None
+    };
+    let secret_hash = if let Some(secret) = &new_secret {
+        Some(sha256_hex(secret))
+    } else if secret_needed {
+        existing.secret_hash.clone()
+    } else {
+        None
+    };
+
+    st.db.with(|c| {
+        c.execute(
+            "UPDATE clients SET name = ?1, secret_hash = ?2, redirect_uris = ?3,
+                 post_logout_redirect_uris = ?4, grant_types = ?5, scopes = ?6,
+                 auth_method = ?7, jwks = ?8, require_dpop = ?9, require_par = ?10,
+                 backchannel_logout_uri = ?11, backchannel_logout_session_required = ?12
+             WHERE id = ?13",
+            params![
+                name,
+                secret_hash,
+                serde_json::to_string(&redirect_uris).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&post_logout).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&grant_types).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&scopes).unwrap_or_else(|_| "[]".into()),
+                auth_method,
+                jwks,
+                body.get("require_dpop")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(existing.require_dpop) as i64,
+                body.get("require_pushed_authorization_requests")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(existing.require_par) as i64,
+                backchannel_logout_uri,
+                backchannel_required as i64,
+                client_id,
+            ],
+        )?;
+        Ok(())
+    })?;
+
+    let updated = st
+        .db
+        .with(|c| db::load_client(c, client_id))?
+        .ok_or_else(|| OauthError::server_error("client disappeared during update"))?;
+    let mut response = client_metadata_json(&updated, new_secret.as_deref());
+    response["client_id_issued_at"] = json!(0);
+    response["client_secret_expires_at"] = json!(0);
+
+    let mut res = Json(response).into_response();
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(res)
+}
+
+pub async fn delete_client(
+    State(st): State<AppState>,
+    Path(client_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let result: ApiResult<Response> = (|| {
+        authenticate_registration_client(&st, &headers, &client_id)?;
+        st.db.tx(|tx| {
+            for statement in [
+                "DELETE FROM access_tokens WHERE client_id = ?1",
+                "DELETE FROM refresh_tokens WHERE client_id = ?1",
+                "DELETE FROM consents WHERE client_id = ?1",
+                "DELETE FROM device_codes WHERE client_id = ?1",
+                "DELETE FROM flows WHERE client_id = ?1",
+            ] {
+                tx.execute(statement, params![client_id])?;
+            }
+            tx.execute("DELETE FROM clients WHERE id = ?1", params![client_id])?;
+            Ok(())
+        })?;
+        Ok(StatusCode::NO_CONTENT.into_response())
+    })();
+    match result {
+        Ok(res) => res,
+        Err(error) => error.into_response(),
+    }
+}
+
 pub async fn register_client(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -505,7 +899,10 @@ fn register_client_inner(st: &AppState, headers: &HeaderMap, body: &Value) -> Ap
     if grant_types.iter().any(|g| {
         !matches!(
             g.as_str(),
-            "authorization_code" | "refresh_token" | "client_credentials"
+            "authorization_code"
+                | "refresh_token"
+                | "client_credentials"
+                | "urn:ietf:params:oauth:grant-type:device_code"
         )
     }) {
         return Err(OauthError::invalid_request("unsupported grant type"));
@@ -516,9 +913,7 @@ fn register_client_inner(st: &AppState, headers: &HeaderMap, body: &Value) -> Ap
         .and_then(Value::as_str)
         .map(oidc::split_scope)
         .unwrap_or_else(|| vec!["openid".into(), "profile".into(), "email".into()]);
-    if !scopes.iter().any(|s| s == "openid") {
-        return Err(OauthError::invalid_scope("openid is required"));
-    }
+    validate_registerable_scopes(&scopes)?;
 
     let client_id = format!("kagi_{}", random_token(12));
     let secret = if auth_method.starts_with("client_secret") {
@@ -527,6 +922,10 @@ fn register_client_inner(st: &AppState, headers: &HeaderMap, body: &Value) -> Ap
         None
     };
     let secret_hash = secret.as_deref().map(sha256_hex);
+    // RFC 7592 registration access token. Only its hash is persisted; the
+    // plaintext is shown exactly once in the creation response.
+    let registration_token = random_token(32);
+    let registration_token_hash = sha256_hex(&registration_token);
     let name = body
         .get("client_name")
         .and_then(Value::as_str)
@@ -555,13 +954,19 @@ fn register_client_inner(st: &AppState, headers: &HeaderMap, body: &Value) -> Ap
             )));
         }
     }
+    let backchannel_logout_uri = parse_optional_uri(
+        body.get("backchannel_logout_uri"),
+        "backchannel_logout_uri",
+    )?;
 
     st.db.with(|c| {
         c.execute(
             "INSERT INTO clients
                 (id, name, secret_hash, redirect_uris, post_logout_redirect_uris, grant_types,
-                 scopes, auth_method, jwks, require_dpop, require_par, id_token_alg, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'ES256', ?12)",
+                 scopes, auth_method, jwks, require_dpop, require_par, id_token_alg,
+                 registration_token_hash, backchannel_logout_uri,
+                 backchannel_logout_session_required, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'ES256', ?12, ?13, ?14, ?15)",
             params![
                 client_id,
                 name,
@@ -576,6 +981,11 @@ fn register_client_inner(st: &AppState, headers: &HeaderMap, body: &Value) -> Ap
                     .and_then(Value::as_bool)
                     .unwrap_or(false) as i64,
                 body.get("require_pushed_authorization_requests")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false) as i64,
+                registration_token_hash,
+                backchannel_logout_uri.clone(),
+                body.get("backchannel_logout_session_required")
                     .and_then(Value::as_bool)
                     .unwrap_or(false) as i64,
                 now(),
@@ -598,7 +1008,21 @@ fn register_client_inner(st: &AppState, headers: &HeaderMap, body: &Value) -> Ap
             .get("require_pushed_authorization_requests")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "registration_access_token": registration_token,
+        "registration_client_uri": st
+            .cfg
+            .endpoint(&format!("/register/{client_id}")),
     });
+    if let Some(uri) = &backchannel_logout_uri {
+        response["backchannel_logout_uri"] = json!(uri);
+    }
+    if body
+        .get("backchannel_logout_session_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        response["backchannel_logout_session_required"] = json!(true);
+    }
     if let Some(secret) = secret {
         response["client_secret"] = json!(secret);
         response["client_secret_expires_at"] = json!(0);

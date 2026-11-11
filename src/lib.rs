@@ -1,6 +1,8 @@
 mod auth;
+mod backchannel;
 mod config;
 mod db;
+mod device;
 mod dpop;
 mod error;
 mod jose;
@@ -206,6 +208,11 @@ fn routes_and_security(state: AppState) -> Router {
         .route("/authorize", get(oidc::authorize))
         .route("/par", post(oidc::par))
         .route("/token", post(oidc::token))
+        .route("/device_authorization", post(device::authorization))
+        .route(
+            "/device",
+            get(device::verification_page).post(device::verification_submit),
+        )
         .route(
             "/userinfo",
             get(resource::userinfo).post(resource::userinfo),
@@ -217,6 +224,12 @@ fn routes_and_security(state: AppState) -> Router {
             get(resource::end_session_get).post(resource::end_session_post),
         )
         .route("/register", post(resource::register_client))
+        .route(
+            "/register/{client_id}",
+            get(resource::client_info)
+                .put(resource::update_client)
+                .delete(resource::delete_client),
+        )
         .route("/admin/keys/rotate", post(resource::rotate_keys))
         .route("/admin/stats", get(resource::admin_stats))
         .route("/healthz", get(resource::health))
@@ -245,10 +258,12 @@ fn api_path(path: &str) -> bool {
                 | "/introspect"
                 | "/revoke"
                 | "/register"
+                | "/device_authorization"
                 | "/healthz"
                 | "/readyz"
                 | "/api/recover"
         )
+        || path.starts_with("/register/")
 }
 
 fn same_origin(a: &str, b: &str) -> bool {
@@ -261,6 +276,7 @@ fn same_origin(a: &str, b: &str) -> bool {
 fn browser_post(path: &str) -> bool {
     path == "/consent"
         || path == "/logout"
+        || path == "/device"
         || path.starts_with("/account")
         || path.starts_with("/api/account")
         || path.starts_with("/api/webauthn")
@@ -368,7 +384,10 @@ async fn harden(State(st): State<AppState>, mut req: Request, next: Next) -> Res
             "/token" => Some(("oauth-token", 60)),
             "/userinfo" | "/introspect" | "/revoke" => Some(("oauth-resource", 60)),
             "/par" => Some(("oauth-par", 30)),
+            "/device_authorization" => Some(("oauth-device", 15)),
+            "/device" => Some(("device-verification", 20)),
             "/register" => Some(("client-registration", 5)),
+            p if p.starts_with("/register/") => Some(("client-management", 30)),
             "/admin/keys/rotate" => Some(("key-rotation", 3)),
             "/login" | "/signup" | "/recover" => Some(("auth-page", 60)),
             _ => None,
@@ -692,6 +711,8 @@ mod production_config_tests {
             refresh_ttl: 2_592_000,
             id_ttl: 300,
             par_ttl: 90,
+            device_ttl: 600,
+            device_interval: 5,
         }
     }
 

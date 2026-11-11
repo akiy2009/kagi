@@ -46,7 +46,7 @@ fn client_meta(headers: &HeaderMap) -> (Option<String>, Option<String>) {
     )
 }
 
-fn audit(st: &AppState, user_id: Option<&str>, kind: &str, detail: &str, headers: &HeaderMap) {
+pub(crate) fn audit(st: &AppState, user_id: Option<&str>, kind: &str, detail: &str, headers: &HeaderMap) {
     let (ip, ua) = client_meta(headers);
     let _ = st
         .db
@@ -191,6 +191,14 @@ pub fn end_local_session(st: &AppState, headers: &HeaderMap) -> Vec<HeaderValue>
         }
     }
     if !hashes.is_empty() {
+        // Resolve the sessions before deleting the rows: back-channel logout
+        // needs the user and session identifiers after the tokens are revoked.
+        let mut ended: Vec<(String, String)> = Vec::new();
+        for hash in &hashes {
+            if let Ok(Some(session)) = st.db.with(|c| db::load_session(c, hash)) {
+                ended.push((session.user_id, session.id));
+            }
+        }
         // Logout must revoke server-tracked JWTs as well as deleting the browser
         // session. Otherwise a copied access token could remain active until exp.
         let _ = st.db.tx(|tx| {
@@ -200,6 +208,9 @@ pub fn end_local_session(st: &AppState, headers: &HeaderMap) -> Vec<HeaderValue>
             }
             Ok(())
         });
+        for (user_id, session_id) in ended {
+            crate::backchannel::notify(st, &user_id, Some(&session_id));
+        }
     }
     cleared_cookies(st)
 }
@@ -234,7 +245,7 @@ fn require_session(st: &AppState, headers: &HeaderMap) -> Result<(Session, User)
 // Flow helpers
 // ---------------------------------------------------------------------------
 
-fn insert_flow(
+pub(crate) fn insert_flow(
     st: &AppState,
     kind: &str,
     user_id: Option<&str>,
@@ -295,6 +306,21 @@ fn bad_request(message: &str) -> Response {
         .into_response()
 }
 
+/// Only same-origin, absolute paths are accepted as post-login destinations.
+/// This blocks `//evil.example`, backslash tricks and header/control injection.
+pub fn safe_next(raw: &str) -> String {
+    if raw.len() <= 512
+        && raw.starts_with('/')
+        && !raw.starts_with("//")
+        && !raw.contains('\\')
+        && !raw.chars().any(char::is_control)
+    {
+        raw.to_string()
+    } else {
+        "/".to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Login
 // ---------------------------------------------------------------------------
@@ -305,18 +331,21 @@ pub async fn login_page(
 ) -> Response {
     let rid = match q.get("rid") {
         Some(rid) => rid.clone(),
-        None => match insert_flow(
-            &st,
-            "session",
-            None,
-            None,
-            &json!({}),
-            Some(random_token(18).as_str()),
-            600,
-        ) {
-            Ok(flow) => return oidc::redirect_302(&format!("/login?rid={}", urlenc(&flow.id))),
-            Err(_) => return bad_request("ログイン画面を初期化できませんでした"),
-        },
+        None => {
+            let next = safe_next(q.get("next").map(String::as_str).unwrap_or("/"));
+            match insert_flow(
+                &st,
+                "session",
+                None,
+                None,
+                &json!({ "next": next }),
+                Some(random_token(18).as_str()),
+                600,
+            ) {
+                Ok(flow) => return oidc::redirect_302(&format!("/login?rid={}", urlenc(&flow.id))),
+                Err(_) => return bad_request("ログイン画面を初期化できませんでした"),
+            }
+        }
     };
 
     let flow = match st.db.with(|c| db::load_flow(c, &rid)) {
@@ -461,7 +490,11 @@ fn login_verify_inner(
     let next = if flow.kind == "authorize" {
         format!("/consent?rid={}", urlenc(&flow.id))
     } else {
-        "/".to_string()
+        flow.payload
+            .get("next")
+            .and_then(Value::as_str)
+            .map(safe_next)
+            .unwrap_or_else(|| "/".to_string())
     };
 
     let res = Json(json!({ "ok": true, "next": next })).into_response();
@@ -1246,6 +1279,7 @@ fn revoke_session_inner(
     if changed == 0 {
         return Err(OauthError::invalid_request("セッションが見つかりません"));
     }
+    crate::backchannel::notify(st, &user.id, Some(&req.id));
     audit(
         st,
         Some(&user.id),
@@ -1275,6 +1309,15 @@ pub async fn revoke_other_sessions(State(st): State<AppState>, headers: HeaderMa
 
 fn revoke_other_sessions_inner(st: &AppState, headers: &HeaderMap) -> Result<Response, OauthError> {
     let (current, user) = require_session(st, headers)?;
+    let others: Vec<String> = st.db.with(|c| {
+        let rows = c.query_all(
+            "SELECT id FROM sessions WHERE user_id = ?1 AND id <> ?2",
+            params![user.id, current.id],
+        )?;
+        rows.iter()
+            .map(|row| row.get::<_, String>(0).map_err(|e| anyhow::anyhow!(e.to_string())))
+            .collect()
+    })?;
     let revoked = st.db.tx(|tx| {
         tx.execute(
             "UPDATE refresh_tokens SET revoked = 1
@@ -1298,6 +1341,9 @@ fn revoke_other_sessions_inner(st: &AppState, headers: &HeaderMap) -> Result<Res
         &format!("他のデバイス {revoked} 件をサインアウト"),
         headers,
     );
+    for session_id in others {
+        crate::backchannel::notify(st, &user.id, Some(&session_id));
+    }
     Ok(Json(json!({ "ok": true, "revoked": revoked })).into_response())
 }
 

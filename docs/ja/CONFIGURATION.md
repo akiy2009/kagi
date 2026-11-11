@@ -51,6 +51,8 @@
 | `KAGI_REFRESH_TTL` | `2592000` | リフレッシュトークンの有効期限（30 日）。 |
 | `KAGI_ID_TTL` | `300` | ID トークンの有効期限（5 分）。 |
 | `KAGI_PAR_TTL` | `90` | PAR の `request_uri` の有効期限。 |
+| `KAGI_DEVICE_TTL` | `600` | RFC 8628 デバイスコードの有効期限。 |
+| `KAGI_DEVICE_INTERVAL` | `5` | デバイスの最小ポーリング間隔（秒）。早すぎるポーリングは `slow_down` になり、間隔が 5 秒延びます。 |
 
 ## 本番環境のベースライン例
 

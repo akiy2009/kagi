@@ -192,9 +192,16 @@ def main():
               and doc.get("jwks_uri", "").startswith("http"), doc)
         check("OIDC advertises code + S256", "code" in doc.get("response_types_supported", [])
               and "S256" in doc.get("code_challenge_methods_supported", []), doc)
-        check("discovery does not advertise an unsupported claims parameter",
-              doc.get("claims_parameter_supported") is False,
+        check("discovery advertises the supported claims parameter",
+              doc.get("claims_parameter_supported") is True,
               doc.get("claims_parameter_supported"))
+        check("discovery advertises the device authorization endpoint",
+              doc.get("device_authorization_endpoint", "").startswith("http")
+              and "urn:ietf:params:oauth:grant-type:device_code"
+              in doc.get("grant_types_supported", []), doc)
+        check("discovery advertises back-channel logout",
+              doc.get("backchannel_logout_supported") is True
+              and doc.get("backchannel_logout_session_supported") is True, doc)
         check("discovery advertises the kagi ACR values",
               "urn:kagi:acr:passkey" in doc.get("acr_values_supported", [])
               and "urn:kagi:acr:recovery" in doc.get("acr_values_supported", []),

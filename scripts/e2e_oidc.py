@@ -229,12 +229,17 @@ authz3 = dict(authz); authz3["dpop_jkt"] = jkt; authz3["state"] = "st-dpop"
 s, h, j, b = form_post("/par", authz3, {"DPoP": dpop("POST", BASE + "/par")})
 check("PAR with DPoP", s == 201, b)
 ru3 = j["request_uri"]
-s, h, b = req("GET", "/authorize?" + up.urlencode({"client_id": CLIENT, "request_uri": ru3}), {"Cookie": "kagi_sid=" + sid})
-rid3 = up.parse_qs(up.urlparse(h.get("Location", "")).query).get("rid", [""])[0]
-s, h, b = req("GET", "/consent?rid=" + rid3, headers={"Cookie": "kagi_sid=" + sid})
-inp3 = dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', b.decode()))
-s, h, b = req("POST", "/consent", {"rid": rid3, "csrf": inp3.get("csrf", ""), "decision": "allow"}, {"Cookie": "kagi_sid=" + sid})
-code3 = up.parse_qs(up.urlparse(h.get("Location", "")).query).get("code", [""])[0]
+s, h, b = req("GET", "/authorize?" + up.urlencode({"client_id": CLIENT, "request_uri": ru3}),
+              {"Cookie": "kagi_sid=" + sid})
+loc3 = h.get("Location", "")
+if loc3.startswith("/consent?rid="):
+    rid3 = up.parse_qs(up.urlparse(loc3).query)["rid"][0]
+    s, h, b = req("GET", "/consent?rid=" + rid3, headers={"Cookie": "kagi_sid=" + sid})
+    inp3 = dict(re.findall(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', b.decode()))
+    s, h, b = req("POST", "/consent", {"rid": rid3, "csrf": inp3.get("csrf", ""), "decision": "allow"},
+                  {"Cookie": "kagi_sid=" + sid})
+    loc3 = h.get("Location", "")
+code3 = up.parse_qs(up.urlparse(loc3).query).get("code", [""])[0]
 s, h, j, b = form_post("/token", {"grant_type": "authorization_code", "code": code3, "redirect_uri": REDIRECT,
                                   "client_id": CLIENT, "code_verifier": verifier}, {"DPoP": dpop("POST", BASE + "/token")})
 check("DPoP token issuance", s == 200 and j.get("token_type") == "DPoP", b)

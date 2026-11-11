@@ -79,6 +79,10 @@ curl -fsS https://YOUR-ISSUER/jwks.json</code></pre>
 <tr><td>JARM</td><td><code>response_mode=jwt</code> / <code>query.jwt</code> / <code>fragment.jwt</code>。認可レスポンスを署名済み JWT で返す。</td></tr>
 <tr><td>クライアント認証</td><td><code>client_secret_basic</code>、<code>client_secret_post</code>、<code>private_key_jwt</code>、パブリッククライアント。<code>private_key_jwt</code> はインラインの公開 JWKS が必要。</td></tr>
 <tr><td>ACR</td><td><code>acr_values_supported</code> は <code>urn:kagi:acr:passkey</code> と <code>urn:kagi:acr:recovery</code>。要求に合わないセッションは <code>unmet_authentication_requirements</code>。</td></tr>
+<tr><td><code>claims</code> パラメーター</td><td>ID トークン / UserInfo で必要なクレームを指定。<code>essential</code> と <code>acr</code> の値制約に対応。未知のクレーム、過大な値、スコープ外の必須クレームは拒否。</td></tr>
+<tr><td>デバイス認可（RFC 8628）</td><td><code>/device_authorization</code> で <code>device_code</code> と <code>user_code</code> を発行し、<code>/device</code> で承認。ポーリングは <code>authorization_pending</code> / <code>slow_down</code> / <code>access_denied</code> / <code>expired_token</code> を処理。</td></tr>
+<tr><td>クライアント管理（RFC 7592）</td><td><code>registration_access_token</code> で <code>GET</code> / <code>PUT</code> / <code>DELETE /register/{client_id}</code>。メタデータ更新、シークレットローテーション、削除に対応。</td></tr>
+<tr><td>Back-Channel Logout 1.0</td><td>セッション終了時に署名済み <code>logout_token</code> を POST。<code>sid</code>、<code>events</code>、<code>jti</code> を検証。配信先は HTTPS（開発時のみループバック HTTP）に制限。</td></tr>
 </tbody></table></div>
 <div class="notice"><strong>DPoP の注意</strong><br>DPoP 束縛トークンを <code>Bearer</code> で提示した場合（またはその逆）は RFC 9449 §7.1 に従い 401 を返します。リフレッシュトークンもローテーションされ、古いトークンの再利用はファミリー全体の失効につながります。</div>
 </section>
