@@ -25,8 +25,8 @@ Kagi Identity（Kagi ID）は、Rust で実装されたパスキー中心の認�
 | 領域 | 機能 |
 | --- | --- |
 | 認証 | WebAuthn パスキー登録・サインイン、discoverable credential、conditional UI、`none` / `packed` 自己証明、署名カウンタによるクローン検出、BE/BS フラグ |
-| 認可 | Authorization Code フロー、PKCE S256、state / nonce、同意画面、`prompt=none/login/consent/select_account`、同意の記憶、`max_age`、RFC 9207 の `iss` |
-| OAuth / OIDC | Discovery、JWKS、UserInfo、Introspection、Revocation、RP-initiated Logout、動的クライアント登録（RFC 7591） |
+| 認可 | Authorization Code フロー、PKCE S256、state / nonce、同意画面、`prompt=none/login/consent/select_account`、同意の記憶、`max_age`、RFC 9207 の `iss`、OIDC `claims` パラメーター |
+| OAuth / OIDC | Discovery、JWKS、UserInfo、Introspection、Revocation、RP-initiated Logout、動的クライアント登録（RFC 7591）、クライアント管理（RFC 7592）、デバイス認可グラント（RFC 8628）、Back-Channel Logout 1.0 |
 | 高度なプロファイル | PAR（RFC 9126）、DPoP（RFC 9449、`cnf.jkt` / `ath` / `jti` リプレイ防止）、JAR（RFC 9101）、JARM（`response_mode=jwt/query.jwt/fragment.jwt`） |
 | クライアント認証 | `client_secret_basic`、`client_secret_post`、`private_key_jwt`（RS256 / PS256 / ES256 / EdDSA）、パブリッククライアント |
 | トークン | ES256 署名の JWT アクセストークン（`typ: at+jwt`）、リフレッシュトークンローテーションと再利用検出（ファミリー失効）、`at_hash`、`sid` |
@@ -35,9 +35,18 @@ Kagi Identity（Kagi ID）は、Rust で実装されたパスキー中心の認�
 | 連携 | 組み込みデモ RP、ブラウザー SDK（`/static/kagi.js`）、CORS 制御された API |
 | アカウントコンソール | プロフィール編集、パスキーの追加・名前変更・削除、端末（セッション）一覧と一括サインアウト、連携アプリの同意取消、リカバリーコード、監査イベント、アカウント削除 |
 | 運用 | レート制限、監査ログ、`/healthz` / `/readyz`（DB 検査付き）、`/admin/stats`、起動時の設定検証 |
-| セキュリティ制御 | PKCE 強制、redirect URI の完全一致、Origin + `Sec-Fetch-Site` 検証、CSRF トークン、CSP / HSTS / COOP / CORP / Permissions-Policy、HttpOnly + SameSite=Lax セッション、保存時の SHA-256 |
+| セキュリティ制御 | PKCE 強制、redirect URI の完全一致、Origin + `Sec-Fetch-Site` 検証、CSRF トークン、CSP / HSTS / COOP / CORP / Permissions-Policy、HttpOnly + SameSite=Lax セッション、保存時の SHA-256、SSRF 対策済み Back-Channel 配信 |
 
 機能の存在は、各 RFC の全要件や認証プロファイルへの適合を意味しません。デプロイするコミットと設定で実際に確認してください。
+
+### 任意の拡張機能
+
+- **デバイス認可グラント（RFC 8628）**: 入力が難しい端末向けに `/device_authorization` と `/device` の承認画面を提供します。コードはハッシュのみ保存し、1 回限り・レート制限付きです。
+- **クライアント管理（RFC 7592）**: 登録時に発行される `registration_access_token` で `GET` / `PUT` / `DELETE /register/{client_id}` を呼び出し、メタデータ更新、シークレットローテーション、削除ができます。
+- **`claims` パラメーター**: ID トークンと UserInfo で要求するクレームを指定できます。未知のクレーム、過大な値、スコープ外の必須クレームは拒否されます。
+- **Back-Channel Logout 1.0**: セッション終了時に署名済み `logout_token` を RP へ配信します。本番では HTTPS のみ、プライベート / リンクローカル宛先は拒否されます。
+
+詳細とリクエスト例は [クライアント連携](CLIENT_INTEGRATION.md) を参照してください。
 
 ## 設計上の要点
 
@@ -46,7 +55,7 @@ Kagi Identity（Kagi ID）は、Rust で実装されたパスキー中心の認�
 - **クライアントシークレットは SHA-256。** 32 バイトのランダム値をサーバーが生成するため、オフライン総当たりの対象になりません。Argon2 を使う理由がないため認証遅延を一定に保っています。
 - **DPoP はコード発行時点で束縛。** `dpop_jkt` を認可コードに記録し、トークン交換時に照合します。DPoP 束縛トークンを `Bearer` で提示した場合（またはその逆）は RFC 9449 §7.1 に従い 401 を返します。
 - **同意はサーバー側に保存。** `prompt=none` は「セッションなし → `login_required`」「同意なし → `consent_required`」「両方あり → コード発行」の順で解決します。新しいスコープには再同意が必要です。
-- **単一ノード前提の部分がある。** プロセス内キャッシュ（署名鍵・一部レート制限）は複数インスタンス間で完全共有されません。`request_uri` は `urn:ietf:params:oauth:request_uri:*` のみを受け付け、HTTPS フェッチによる SSRF を避けています。バックチャネルログアウト、CIBA、SD-JWT VC は未実装です。
+- **単一ノード前提の部分がある。** プロセス内キャッシュ（署名鍵・一部レート制限）は複数インスタンス間で完全共有されません。`request_uri` は `urn:ietf:params:oauth:request_uri:*` のみを受け付け、HTTPS フェッチによる SSRF を避けています。CIBA と SD-JWT VC は未実装です。
 
 ## ライセンス
 
