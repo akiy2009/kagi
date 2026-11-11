@@ -135,11 +135,17 @@ fn validate_destination(url: &str, production: bool) -> Result<Vec<SocketAddr>, 
     if host.is_empty() {
         return Err("missing host");
     }
+    // `http::uri::Authority::host` keeps the brackets around an IPv6 literal,
+    // which `IpAddr::from_str` does not accept.
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
     let port = authority
         .port_u16()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
-    let addresses: Vec<SocketAddr> = match host.parse::<IpAddr>() {
+    let addresses: Vec<SocketAddr> = match literal.parse::<IpAddr>() {
         Ok(ip) => vec![SocketAddr::new(ip, port)],
         Err(_) => (host, port)
             .to_socket_addrs()
