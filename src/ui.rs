@@ -211,6 +211,59 @@ pub fn consent_page(
     )
 }
 
+/// RFC 8628 verification page. The user types the code shown on their device
+/// and explicitly approves or denies the grant.
+pub fn device_page(rid: &str, csrf: &str, prefill: &str, username: &str) -> String {
+    page(
+        "デバイスの承認",
+        &format!(
+            r#"<section class="card narrow">
+{brand}
+<p class="eyebrow">デバイス承認</p>
+<h1>デバイスを接続</h1>
+<p class="muted"><strong>{user}</strong> としてサインイン中。デバイスに表示されたコードを入力してください。</p>
+<form method="post" action="/device" class="stack">
+  <input type="hidden" name="rid" value="{rid}">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <label class="field">
+    <span>デバイスコード</span>
+    <input id="user_code" name="user_code" value="{prefill}" autocomplete="one-time-code"
+      autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH" required
+      maxlength="24" autofocus>
+  </label>
+  <div class="row">
+    <button class="ghost" type="submit" name="decision" value="deny">拒否</button>
+    <button class="primary" type="submit" name="decision" value="allow"><span class="label">許可</span></button>
+  </div>
+</form>
+<p class="hint">心当たりのないコードは許可しないでください。コードは第三者に伝えないでください。</p>
+</section>"#,
+            brand = brand(),
+            user = esc(username),
+            rid = esc(rid),
+            csrf = esc(csrf),
+            prefill = esc(prefill),
+        ),
+    )
+}
+
+pub fn device_result_page(title: &str, message: &str) -> String {
+    page(
+        title,
+        &format!(
+            r#"<section class="card narrow">
+{brand}
+<h1>{title}</h1>
+<p class="muted">{message}</p>
+<p class="foot"><a href="/">アカウントに戻る</a></p>
+</section>"#,
+            brand = brand(),
+            title = esc(title),
+            message = esc(message),
+        ),
+    )
+}
+
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
