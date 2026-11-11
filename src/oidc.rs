@@ -110,7 +110,160 @@ pub fn scope_contains(scope: &str, name: &str) -> bool {
     split_scope(scope).iter().any(|s| s == name)
 }
 
-fn scope_subset(requested: &str, allowed: &str) -> bool {
+// ---------------------------------------------------------------------------
+// OIDC `claims` request parameter
+// ---------------------------------------------------------------------------
+
+/// Claims kagi can release in an ID Token or at UserInfo. Keeping this list
+/// closed prevents a client from probing for internal attributes by name.
+const SUPPORTED_CLAIMS: [&str; 10] = [
+    "sub",
+    "auth_time",
+    "acr",
+    "amr",
+    "sid",
+    "name",
+    "preferred_username",
+    "email",
+    "email_verified",
+    "iss",
+];
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimsRequest {
+    #[serde(default)]
+    pub id_token: std::collections::BTreeMap<String, Option<ClaimSpec>>,
+    #[serde(default)]
+    pub userinfo: std::collections::BTreeMap<String, Option<ClaimSpec>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimSpec {
+    #[serde(default)]
+    pub essential: bool,
+    #[serde(default)]
+    pub value: Option<Value>,
+    #[serde(default)]
+    pub values: Option<Vec<Value>>,
+}
+
+impl ClaimsRequest {
+    fn targets(&self) -> impl Iterator<Item = &std::collections::BTreeMap<String, Option<ClaimSpec>>> {
+        [&self.id_token, &self.userinfo].into_iter()
+    }
+}
+
+fn parse_claims_request(raw: &str) -> ApiResult<ClaimsRequest> {
+    if raw.len() > 4096 {
+        return Err(OauthError::invalid_request(
+            "claims parameter is too large (maximum 4096 bytes)",
+        ));
+    }
+    let request: ClaimsRequest = serde_json::from_str(raw)
+        .map_err(|_| OauthError::invalid_request("claims must be a valid JSON object"))?;
+    for target in request.targets() {
+        for (claim, spec) in target {
+            if !SUPPORTED_CLAIMS.iter().any(|supported| supported == claim) {
+                return Err(OauthError::invalid_request(format!(
+                    "claim {claim} is not supported"
+                )));
+            }
+            if let Some(spec) = spec {
+                if (spec.value.is_some() || spec.values.is_some()) && claim != "acr" {
+                    return Err(OauthError::invalid_request(
+                        "value/values are only supported for the acr claim",
+                    ));
+                }
+                if let Some(values) = &spec.values {
+                    if values.is_empty() || values.len() > 8 {
+                        return Err(OauthError::invalid_request(
+                            "acr values must contain between 1 and 8 entries",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(request)
+}
+
+/// Parse and validate the request parameter once, returning the canonical JSON
+/// that is persisted with the authorization grant.
+pub fn normalized_claims(p: &AuthzParams) -> ApiResult<Option<String>> {
+    let Some(raw) = p.claims.as_deref() else {
+        return Ok(None);
+    };
+    let request = parse_claims_request(raw)?;
+    serde_json::to_string(&request)
+        .map(Some)
+        .map_err(|_| OauthError::server_error("could not serialise claims request"))
+}
+
+/// ACR values required by `claims.id_token.acr`, if the client constrained it.
+fn claims_acr_values_from_spec(spec: &ClaimSpec) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(value) = &spec.value {
+        if let Some(value) = value.as_str() {
+            values.push(value.to_string());
+        }
+    }
+    if let Some(list) = &spec.values {
+        for value in list {
+            if let Some(value) = value.as_str() {
+                values.push(value.to_string());
+            }
+        }
+    }
+    values
+}
+
+/// Check that every claim the client marked `essential` can actually be
+/// released. Shown as an authorization error rather than silently omitting a
+/// claim the RP said it cannot work without.
+fn essential_claims_satisfied(
+    p: &AuthzParams,
+    client: &Client,
+    user: &User,
+    session: &Session,
+) -> Result<(), String> {
+    let Some(raw) = normalized_claims(p).map_err(|e| e.description)? else {
+        return Ok(());
+    };
+    let request: ClaimsRequest = serde_json::from_str(&raw).map_err(|_| "invalid claims".to_string())?;
+    let has_profile = client.scopes.iter().any(|s| s == "profile")
+        && p.scope.split_whitespace().any(|s| s == "profile");
+    let has_email = client.scopes.iter().any(|s| s == "email")
+        && p.scope.split_whitespace().any(|s| s == "email");
+    for target in request.targets() {
+        for (claim, spec) in target {
+            let essential = spec.as_ref().is_some_and(|s| s.essential);
+            if !essential {
+                continue;
+            }
+            let available = match claim.as_str() {
+                "sub" | "auth_time" | "amr" | "sid" | "iss" => true,
+                "acr" => {
+                    let required = spec
+                        .as_ref()
+                        .map(claims_acr_values_from_spec)
+                        .unwrap_or_default();
+                    required.is_empty() || required.iter().any(|value| value == &session.acr)
+                }
+                "name" | "preferred_username" => has_profile,
+                "email" | "email_verified" => has_email && user.email.is_some(),
+                _ => false,
+            };
+            if !available {
+                return Err(format!("essential claim {claim} cannot be provided"));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn scope_subset(requested: &str, allowed: &str) -> bool {
     let allowed = split_scope(allowed);
     split_scope(requested)
         .iter()
@@ -145,7 +298,27 @@ fn required_acrs(p: &AuthzParams) -> Vec<&'static str> {
 
 fn acr_satisfied(p: &AuthzParams, session: &Session) -> bool {
     let required = required_acrs(p);
-    required.is_empty() || required.iter().any(|acr| *acr == session.acr)
+    let list_ok = required.is_empty() || required.iter().any(|acr| *acr == session.acr);
+    if !list_ok {
+        return false;
+    }
+    // A `claims.id_token.acr` constraint is just as binding as acr_values.
+    let Ok(raw) = normalized_claims(p) else {
+        return false;
+    };
+    let Some(raw) = raw else {
+        return true;
+    };
+    let Ok(request) = serde_json::from_str::<ClaimsRequest>(&raw) else {
+        return false;
+    };
+    let claims_required = request
+        .id_token
+        .get("acr")
+        .and_then(Option::as_ref)
+        .map(claims_acr_values_from_spec)
+        .unwrap_or_default();
+    claims_required.is_empty() || claims_required.iter().any(|acr| acr == &session.acr)
 }
 
 // ---------------------------------------------------------------------------
@@ -162,13 +335,17 @@ pub async fn discovery(State(st): State<AppState>) -> Response {
         "jwks_uri": cfg.endpoint("/jwks.json"),
         "registration_endpoint": cfg.endpoint("/register"),
         "pushed_authorization_request_endpoint": cfg.endpoint("/par"),
+        "device_authorization_endpoint": cfg.endpoint("/device_authorization"),
         "introspection_endpoint": cfg.endpoint("/introspect"),
         "revocation_endpoint": cfg.endpoint("/revoke"),
         "end_session_endpoint": cfg.endpoint("/logout"),
         "scopes_supported": ["openid", "profile", "email", "offline_access"],
         "response_types_supported": ["code"],
         "response_modes_supported": ["query", "fragment", "jwt", "query.jwt", "fragment.jwt", "form_post"],
-        "grant_types_supported": ["authorization_code", "refresh_token", "client_credentials"],
+        "grant_types_supported": [
+            "authorization_code", "refresh_token", "client_credentials",
+            "urn:ietf:params:oauth:grant-type:device_code"
+        ],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["ES256"],
         "userinfo_signing_alg_values_supported": ["none"],
@@ -186,7 +363,7 @@ pub async fn discovery(State(st): State<AppState>) -> Response {
             "sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "acr", "amr", "azp", "sid",
             "name", "preferred_username", "email", "email_verified"
         ],
-        "claims_parameter_supported": false,
+        "claims_parameter_supported": true,
         "acr_values_supported": [crate::auth::ACR_PASSKEY, crate::auth::ACR_RECOVERY],
         "code_challenge_methods_supported": ["S256"],
         "request_parameter_supported": true,
@@ -200,7 +377,8 @@ pub async fn discovery(State(st): State<AppState>) -> Response {
         "prompt_values_supported": ["none", "login", "consent", "select_account"],
         "require_pushed_authorization_requests": cfg.require_par,
         "tls_client_certificate_bound_access_tokens": false,
-        "backchannel_logout_supported": false,
+        "backchannel_logout_supported": true,
+        "backchannel_logout_session_supported": true,
         "frontchannel_logout_supported": false,
     });
     ([(header::CACHE_CONTROL, "public, max-age=300")], Json(doc)).into_response()
@@ -364,6 +542,22 @@ fn authorize_inner(st: &AppState, headers: &HeaderMap, query: HashMap<String, St
 
     if needs_login {
         return redirect_303(&format!("/login?rid={}", urlenc(&flow.id)));
+    }
+    // A previously remembered consent makes the round trip unnecessary unless
+    // the RP explicitly asks to re-prompt. This keeps authorization code flow
+    // silent without weakening prompt=consent.
+    if !prompt.contains(&"consent") {
+        if let Some(s) = &session {
+            if let Ok(Some(user)) = st.db.with(|c| db::load_user(c, &s.user_id)) {
+                let consented = st
+                    .db
+                    .with(|c| db::consent_covers(c, &user.id, &client.id, &params.scope))
+                    .unwrap_or(false);
+                if consented {
+                    return complete_authorization(st, &flow, &user, s, true);
+                }
+            }
+        }
     }
     redirect_303(&format!("/consent?rid={}", urlenc(&flow.id)))
 }
@@ -571,6 +765,40 @@ fn validate_authorization_params(st: &AppState, p: &AuthzParams) -> ApiResult<Cl
             "prompt=none cannot be combined with other values",
         ));
     }
+    // The `claims` member is attacker-controlled JSON; validate it once here so
+    // token issuance never has to handle a malformed request.
+    normalized_claims(p)?;
+    if p.acr_values.is_some() {
+        let requested = requested_acrs(p);
+        if requested.is_empty()
+            || requested
+                .iter()
+                .all(|value| !SUPPORTED_ACRS.contains(value))
+        {
+            return Err(OauthError::invalid_request(
+                "none of the requested acr_values are supported",
+            ));
+        }
+    }
+    if let Some(raw) = normalized_claims(p)? {
+        if let Ok(request) = serde_json::from_str::<ClaimsRequest>(&raw) {
+            let requested = request
+                .id_token
+                .get("acr")
+                .and_then(Option::as_ref)
+                .map(claims_acr_values_from_spec)
+                .unwrap_or_default();
+            if !requested.is_empty()
+                && requested
+                    .iter()
+                    .all(|value| !SUPPORTED_ACRS.contains(&value.as_str()))
+            {
+                return Err(OauthError::invalid_request(
+                    "the requested acr claim value is not supported",
+                ));
+            }
+        }
+    }
     if let Some(max_age) = p.max_age {
         if max_age < 0 {
             return Err(OauthError::invalid_request("max_age must be non-negative"));
@@ -709,6 +937,9 @@ pub fn complete_authorization(
             "the authenticated session does not satisfy the requested acr",
         );
     }
+    if let Err(reason) = essential_claims_satisfied(&params, &client, user, session) {
+        return authz_fail(st, Some(&params), "access_denied", &reason);
+    }
 
     // Claim the flow before issuing anything. Two concurrent consent posts can
     // both pass the CSRF check and load the same flow; only the winner of this
@@ -753,12 +984,13 @@ pub fn complete_authorization(
     let code = random_token(32);
     let code_hash = sha256_hex(&code);
     let amr = serde_json::to_string(&session.amr).unwrap_or_else(|_| "[]".to_string());
+    let grant_claims = normalized_claims(&params).unwrap_or(None);
     let inserted = st.db.with(|c| {
         c.execute(
             "INSERT INTO auth_codes
                 (code_hash, client_id, user_id, redirect_uri, scope, nonce, code_challenge,
-                 auth_time, amr, acr, dpop_jkt, session_id, expires_at, created_at, consumed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)",
+                 auth_time, amr, acr, dpop_jkt, session_id, claims, expires_at, created_at, consumed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)",
             params![
                 code_hash,
                 client.id,
@@ -772,6 +1004,7 @@ pub fn complete_authorization(
                 session.acr,
                 params.dpop_jkt,
                 session.id,
+                grant_claims,
                 now() + st.cfg.code_ttl,
                 now(),
             ],
@@ -930,6 +1163,9 @@ fn token_inner(
         "authorization_code" => exchange_code(st, &client, form, jkt.as_deref()),
         "refresh_token" => refresh(st, &client, form, jkt.as_deref()),
         "client_credentials" => client_credentials(st, &client, form, jkt.as_deref()),
+        grant if grant == crate::device::DEVICE_GRANT => {
+            crate::device::exchange(st, &client, form, jkt.as_deref())
+        }
         other => Err(OauthError::unsupported(format!(
             "unsupported grant_type {other}"
         ))),
@@ -1015,12 +1251,14 @@ fn exchange_code(
         &row.scope,
         jkt,
         row.session_id.as_deref(),
+        row.claims.as_deref(),
     )?;
 
     let id_token = mint_id_token(
         st,
         &user,
         &client.id,
+        &row.scope,
         row.nonce.as_deref(),
         row.auth_time,
         &row.amr,
@@ -1028,6 +1266,7 @@ fn exchange_code(
         &access_token,
         row.session_id.as_deref(),
         jkt,
+        row.claims.as_deref(),
     )?;
 
     let refresh_token = if scope_contains(&row.scope, "offline_access") {
@@ -1042,6 +1281,7 @@ fn exchange_code(
             jkt,
             row.session_id.as_deref(),
             None,
+            row.claims.as_deref(),
         )?)
     } else {
         None
@@ -1157,8 +1397,8 @@ fn refresh(
         tx.execute(
             "INSERT INTO refresh_tokens
                 (token_hash, family_id, user_id, client_id, scope, auth_time, amr, acr,
-                 dpop_jkt, session_id, issued_at, expires_at, rotated_to, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, 0)",
+                 dpop_jkt, session_id, claims, issued_at, expires_at, rotated_to, revoked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, 0)",
             params![
                 new_hash,
                 row.family_id,
@@ -1170,6 +1410,7 @@ fn refresh(
                 row.acr,
                 row.dpop_jkt,
                 row.session_id,
+                row.claims,
                 now(),
                 now() + st.cfg.refresh_ttl,
             ],
@@ -1192,6 +1433,7 @@ fn refresh(
         &scope,
         jkt,
         row.session_id.as_deref(),
+        row.claims.as_deref(),
     )?;
 
     let id_token = if scope_contains(&scope, "openid") {
@@ -1203,6 +1445,7 @@ fn refresh(
             st,
             &user,
             &client.id,
+            &scope,
             None,
             row.auth_time,
             &row.amr,
@@ -1210,6 +1453,7 @@ fn refresh(
             &access_token,
             row.session_id.as_deref(),
             jkt,
+            row.claims.as_deref(),
         )?)
     } else {
         None
@@ -1255,7 +1499,7 @@ fn client_credentials(
     };
 
     let (access_token, expires_in) =
-        mint_access_token(st, &client.id, &client.id, &scope, jkt, None)?;
+        mint_access_token(st, &client.id, &client.id, &scope, jkt, None, None)?;
 
     Ok(token_response(
         access_token,
@@ -1267,7 +1511,7 @@ fn client_credentials(
     ))
 }
 
-fn token_response(
+pub(crate) fn token_response(
     access_token: String,
     expires_in: i64,
     scope: &str,
@@ -1299,13 +1543,14 @@ fn token_response(
 // Token minting
 // ---------------------------------------------------------------------------
 
-fn mint_access_token(
+pub(crate) fn mint_access_token(
     st: &AppState,
     subject: &str,
     client_id: &str,
     scope: &str,
     jkt: Option<&str>,
     session_id: Option<&str>,
+    grant_claims: Option<&str>,
 ) -> ApiResult<(String, i64)> {
     let issued_at = now();
     let expires_at = issued_at + st.cfg.access_ttl;
@@ -1326,6 +1571,14 @@ fn mint_access_token(
     }
     if let Some(sid) = session_id {
         claims["sid"] = json!(sid);
+    }
+    // UserInfo needs the same claim filter that was consented to at the
+    // authorization endpoint. The request is not secret; only claim names and
+    // essential flags are carried.
+    if let Some(raw) = grant_claims {
+        if let Ok(value) = serde_json::from_str::<Value>(raw) {
+            claims["kagi_claims"] = value;
+        }
     }
 
     let token = st
@@ -1366,7 +1619,7 @@ fn mint_access_token(
 // Token minting signatures mirror the OAuth/OpenID claims they emit; grouping
 // them into a struct would obscure that mapping without removing any argument.
 #[allow(clippy::too_many_arguments)]
-fn mint_refresh_token(
+pub(crate) fn mint_refresh_token(
     st: &AppState,
     user_id: &str,
     client_id: &str,
@@ -1377,6 +1630,7 @@ fn mint_refresh_token(
     jkt: Option<&str>,
     session_id: Option<&str>,
     family_id: Option<&str>,
+    grant_claims: Option<&str>,
 ) -> ApiResult<String> {
     let token = random_token(32);
     let hash = sha256_hex(&token);
@@ -1385,8 +1639,8 @@ fn mint_refresh_token(
         c.execute(
             "INSERT INTO refresh_tokens
                 (token_hash, family_id, user_id, client_id, scope, auth_time, amr, acr,
-                 dpop_jkt, session_id, issued_at, expires_at, rotated_to, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, 0)",
+                 dpop_jkt, session_id, claims, issued_at, expires_at, rotated_to, revoked)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, 0)",
             params![
                 hash,
                 family,
@@ -1398,6 +1652,7 @@ fn mint_refresh_token(
                 acr,
                 jkt,
                 session_id,
+                grant_claims,
                 now(),
                 now() + st.cfg.refresh_ttl,
             ],
@@ -1409,10 +1664,11 @@ fn mint_refresh_token(
 
 // See `mint_refresh_token` for why the claim arguments stay explicit.
 #[allow(clippy::too_many_arguments)]
-fn mint_id_token(
+pub(crate) fn mint_id_token(
     st: &AppState,
     user: &User,
     client_id: &str,
+    scope: &str,
     nonce: Option<&str>,
     auth_time: i64,
     amr: &[String],
@@ -1420,6 +1676,7 @@ fn mint_id_token(
     access_token: &str,
     session_id: Option<&str>,
     dpop_jkt: Option<&str>,
+    grant_claims: Option<&str>,
 ) -> ApiResult<String> {
     let hash = sha256(access_token.as_bytes());
     let at_hash = b64(&hash[..16]);
@@ -1444,6 +1701,33 @@ fn mint_id_token(
     // RFC 9449 §10: bind the ID token to the DPoP key as well.
     if let Some(jkt) = dpop_jkt {
         claims["cnf"] = json!({ "jkt": jkt });
+    }
+    // Only release profile/email claims that the granted scope and an explicit
+    // `claims` request both allow. Scope remains the outer boundary.
+    if let Some(raw) = grant_claims {
+        if let Ok(request) = serde_json::from_str::<ClaimsRequest>(raw) {
+            for claim in request.id_token.keys() {
+                match claim.as_str() {
+                    "name" if scope_contains(scope, "profile") => {
+                        claims["name"] = json!(user.display_name);
+                    }
+                    "preferred_username" if scope_contains(scope, "profile") => {
+                        claims["preferred_username"] = json!(user.username);
+                    }
+                    "email" if scope_contains(scope, "email") => {
+                        if let Some(email) = &user.email {
+                            claims["email"] = json!(email);
+                        }
+                    }
+                    "email_verified"
+                        if scope_contains(scope, "email") && user.email.is_some() =>
+                    {
+                        claims["email_verified"] = json!(user.email_verified);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
     st.keys
         .read()
@@ -1658,4 +1942,127 @@ fn build_fragment(base: &str, params: &[(&str, String)]) -> String {
         out.push_str(&urlenc(v));
     }
     out
+}
+
+#[cfg(test)]
+mod claims_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn params(claims: &str) -> AuthzParams {
+        let mut map = HashMap::new();
+        map.insert("claims".to_string(), claims.to_string());
+        map.insert("scope".to_string(), "openid profile email".to_string());
+        AuthzParams::from_map(&map)
+    }
+
+    #[test]
+    fn unknown_claims_are_rejected() {
+        let error = parse_claims_request(r#"{"id_token":{"password":null}}"#).unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn claim_values_are_only_allowed_for_acr() {
+        let error = parse_claims_request(r#"{"id_token":{"email":{"value":"a@b"}}}"#)
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn oversized_claims_are_rejected() {
+        let raw = format!(r#"{{"userinfo":{{"sub":{{"essential":true}}}},{}"#,
+            " ".repeat(5000));
+        let error = parse_claims_request(&raw).unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn claims_are_canonicalized() {
+        let normalized = normalized_claims(&params(
+            r#"{"id_token":{"email":{"essential":true}},"userinfo":{"name":null}}"#,
+        ))
+        .expect("valid claims");
+        let raw = normalized.expect("claims present");
+        assert!(raw.contains("\"essential\":true"));
+        assert!(raw.contains("\"name\":null"));
+    }
+
+    #[test]
+    fn essential_email_requires_the_email_scope() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claims".to_string(),
+            r#"{"id_token":{"email":{"essential":true}}}"#.to_string(),
+        );
+        map.insert("scope".to_string(), "openid profile".to_string());
+        let params = AuthzParams::from_map(&map);
+        let user = crate::db::User {
+            id: "user-1".to_string(),
+            username: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            email: Some("alice@example.com".to_string()),
+            email_verified: true,
+            created_at: 0,
+        };
+        let session = crate::db::Session {
+            id: "session-1".to_string(),
+            user_id: "user-1".to_string(),
+            auth_time: 0,
+            amr: vec!["passkey".to_string()],
+            acr: crate::auth::ACR_PASSKEY.to_string(),
+            expires_at: 0,
+            created_at: 0,
+            last_seen_at: 0,
+            user_agent: None,
+            ip: None,
+        };
+        let client = crate::db::Client {
+            id: "client-1".to_string(),
+            name: "test".to_string(),
+            secret_hash: None,
+            redirect_uris: vec![],
+            post_logout_redirect_uris: vec![],
+            grant_types: vec!["authorization_code".to_string()],
+            scopes: vec![
+                "openid".to_string(),
+                "profile".to_string(),
+                "email".to_string(),
+            ],
+            auth_method: "none".to_string(),
+            jwks: None,
+            require_dpop: false,
+            require_par: false,
+            id_token_alg: "ES256".to_string(),
+            registration_token_hash: None,
+            backchannel_logout_uri: None,
+            backchannel_logout_session_required: false,
+        };
+        let error = essential_claims_satisfied(&params, &client, &user, &session)
+            .expect_err("email is outside the granted scope");
+        assert!(error.contains("email"));
+    }
+
+    #[test]
+    fn acr_claim_constraint_is_enforced() {
+        let mut map = HashMap::new();
+        map.insert(
+            "claims".to_string(),
+            r#"{"id_token":{"acr":{"value":"urn:kagi:acr:recovery"}}}"#.to_string(),
+        );
+        let params = AuthzParams::from_map(&map);
+        let session = crate::db::Session {
+            id: "s".to_string(),
+            user_id: "u".to_string(),
+            auth_time: 0,
+            amr: vec!["passkey".to_string()],
+            acr: crate::auth::ACR_PASSKEY.to_string(),
+            expires_at: 0,
+            created_at: 0,
+            last_seen_at: 0,
+            user_agent: None,
+            ip: None,
+        };
+        assert!(!acr_satisfied(&params, &session));
+    }
 }
