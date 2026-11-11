@@ -34,7 +34,8 @@ python -m pip install -r requirements-test.txt
 Use a dedicated test database and enable the demo client. Keep this process running in one terminal:
 
 ```bash
-KAGI_SEED_DEMO=1 KAGI_ADMIN_TOKEN=test-admin KAGI_REGISTRATION_TOKEN=reg-secret KAGI_DB=kagi-e2e.db cargo run
+KAGI_SEED_DEMO=1 KAGI_ADMIN_TOKEN=test-admin KAGI_REGISTRATION_TOKEN=reg-secret \
+KAGI_DEVICE_INTERVAL=1 KAGI_DB=kagi-e2e.db cargo run
 ```
 
 In another terminal, use the same `KAGI_DB` value for tests that seed database records:
@@ -43,10 +44,13 @@ In another terminal, use the same `KAGI_DB` value for tests that seed database r
 KAGI_DB=kagi-e2e.db python scripts/e2e_oidc.py
 KAGI_DB=kagi-e2e.db python scripts/e2e_advanced.py
 KAGI_DB=kagi-e2e.db python scripts/e2e_security_races.py
+KAGI_DB=kagi-e2e.db KAGI_REGISTRATION_TOKEN=reg-secret python scripts/e2e_complete_oidc.py
 python scripts/e2e_rate_limit.py
 python scripts/e2e_webauthn.py
 python scripts/e2e_admin.py
 ```
+
+Run suites one at a time against a fresh database and a freshly started server. Rate limits are per process, and the back-channel logout test registers a loopback receiver, so a shared server can make later runs flaky. The new-feature suite expects `KAGI_REGISTRATION_TOKEN` to match the server and sets `KAGI_DEVICE_INTERVAL=1` to keep polling tests quick.
 
 The admin test expects the development-only values shown above. Never reuse them outside an isolated local test instance. The WebAuthn software-authenticator test has its own in-memory/test credential flow and expects the default local origin and RP ID.
 
@@ -60,6 +64,7 @@ On Windows, use PowerShell to set environment variables before invoking each com
 | `e2e_advanced.py` | JARM, DPoP key binding across flow, CORS preflight, max_age |
 | `e2e_webauthn.py` | Passkey signup/sign-in using a software authenticator, challenge/origin/type validation, signature/counter checks |
 | `e2e_admin.py` | Dynamic registration gate, private_key_jwt, JAR, key rotation, logout redirect validation |
+| `e2e_complete_oidc.py` | RFC 8628 device authorization/approval/denial/polling, `claims` validation and token filtering, RFC 7592 client management and secret rotation, signed back-channel logout delivery |
 | `e2e_security_races.py` | Concurrent authorization-code exchange, concurrent DPoP proof replay, key rotation/JWKS overlap, OIDC discovery sanity checks |
 | `e2e_rate_limit.py` | Shared fixed-window rate-limit enforcement and HTTP 429 behavior |
 
