@@ -34,6 +34,7 @@ Kagi Identity（Kagi ID）は、Rust で実装されたパスキー中心の認�
 | ストレージ | 既定は SQLite。`KAGI_DATABASE_URL` で PostgreSQL / Supabase に切り替え |
 | 連携 | 組み込みデモ RP、ブラウザー SDK（`/static/kagi.js`）、CORS 制御された API |
 | アカウントコンソール | プロフィール編集、パスキーの追加・名前変更・削除、端末（セッション）一覧と一括サインアウト、連携アプリの同意取消、リカバリーコード、監査イベント、アカウント削除 |
+| UI / アクセシビリティ | 白黒基調のレスポンシブ UI、自動 / ライト / ダークテーマ（端末内に保存）、キーボードフォーカス、スキップリンク、reduced-motion 対応、ワンタイムコードの自動整形、処理中のインライン表示 |
 | 運用 | レート制限、監査ログ、`/healthz` / `/readyz`（DB 検査付き）、`/admin/stats`、起動時の設定検証 |
 | セキュリティ制御 | PKCE 強制、redirect URI の完全一致、Origin + `Sec-Fetch-Site` 検証、CSRF トークン、CSP / HSTS / COOP / CORP / Permissions-Policy、HttpOnly + SameSite=Lax セッション、保存時の SHA-256、SSRF 対策済み Back-Channel 配信 |
 

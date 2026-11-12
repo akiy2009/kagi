@@ -77,6 +77,7 @@ For troubleshooting, configuration, and setup options, see the [Quickstart guide
 | Storage | SQLite by default; PostgreSQL/Supabase via `KAGI_DATABASE_URL` |
 | Integration | Built-in demo RP and browser SDK at `/static/kagi.js`; CORS-controlled API |
 | Account console | Profile editing, passkey add/rename/delete, device (session) list with single/bulk sign-out, connected-app revocation, recovery codes, audit events, account deletion |
+| Interface | Monochrome responsive UI with automatic/light/dark themes (saved locally), keyboard-first focus states, skip link, reduced-motion support, formatted one-time-code fields and inline loading states |
 | Operations | Rate limiting, audit log, `/healthz` and `/readyz` (with database probe), `/admin/stats`, start-up configuration validation |
 | Security controls | PKCE enforcement, exact redirect URI matching, Origin + `Sec-Fetch-Site` checks, CSRF tokens, CSP/HSTS/COOP/CORP/Permissions-Policy, HttpOnly + SameSite=Lax sessions, SHA-256 at rest for all tokens, SSRF-resistant back-channel delivery |
 

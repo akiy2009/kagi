@@ -26,7 +26,8 @@
   function setMsg(text, ok = false) {
     if (!msgEl) return;
     msgEl.textContent = text || '';
-    msgEl.classList.toggle('ok', !!ok);
+    msgEl.classList.toggle('ok', !!ok && !!text);
+    msgEl.classList.toggle('error', !ok && !!text);
   }
 
   async function post(url, body) {
@@ -125,11 +126,144 @@
     return true;
   }
 
+  function markInvalid(input, invalid) {
+    if (!input) return;
+    if (invalid) input.setAttribute('aria-invalid', 'true');
+    else input.removeAttribute('aria-invalid');
+  }
+
+  /**
+   * Put a button into a pending state without losing its original label.
+   * The original markup is restored when the request fails; successful
+   * requests usually navigate away.
+   */
+  function setBusy(button, busy, label) {
+    if (!button) return;
+    if (busy) {
+      if (button.dataset.idleHtml === undefined) {
+        button.dataset.idleHtml = button.innerHTML;
+      }
+      button.textContent = '';
+      const spinner = document.createElement('span');
+      spinner.className = 'spinner';
+      spinner.setAttribute('aria-hidden', 'true');
+      const text = document.createElement('span');
+      text.className = 'label';
+      text.textContent = label || '処理中…';
+      button.append(spinner, text);
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+    } else {
+      if (button.dataset.idleHtml !== undefined) {
+        button.innerHTML = button.dataset.idleHtml;
+        delete button.dataset.idleHtml;
+      }
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Theme
+  // -------------------------------------------------------------------------
+
+  const THEME_KEY = 'kagi-theme';
+  const THEME_MODES = ['auto', 'light', 'dark'];
+  const THEME_LABELS = { auto: '自動', light: 'ライト', dark: 'ダーク' };
+
+  function readTheme() {
+    try {
+      const saved = window.localStorage.getItem(THEME_KEY);
+      if (saved === 'light' || saved === 'dark') return saved;
+    } catch (_) {
+      /* storage unavailable */
+    }
+    return 'auto';
+  }
+
+  function applyTheme(mode) {
+    const root = document.documentElement;
+    if (mode === 'light' || mode === 'dark') root.dataset.theme = mode;
+    else delete root.dataset.theme;
+    try {
+      window.localStorage.setItem(THEME_KEY, mode);
+    } catch (_) {
+      /* storage unavailable: the choice simply lasts for this page */
+    }
+
+    const button = document.getElementById('theme-toggle');
+    if (!button) return;
+    const label = THEME_LABELS[mode] || THEME_LABELS.auto;
+    const text = button.querySelector('.theme-label');
+    if (text) text.textContent = label;
+    button.dataset.mode = mode;
+    button.setAttribute('aria-label', `テーマ: ${label}`);
+    button.setAttribute('title', `テーマ: ${label}（クリックで切り替え）`);
+  }
+
+  function initTheme() {
+    let mode = readTheme();
+    applyTheme(mode);
+    const button = document.getElementById('theme-toggle');
+    if (!button) return;
+    button.addEventListener('click', () => {
+      const index = THEME_MODES.indexOf(mode);
+      mode = THEME_MODES[(index + 1) % THEME_MODES.length];
+      applyTheme(mode);
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // One-time code inputs
+  // -------------------------------------------------------------------------
+
+  function initCodeInputs() {
+    document.querySelectorAll('[data-code-format]').forEach((input) => {
+      const recovery = input.dataset.codeFormat === 'recovery';
+      const group = recovery ? 5 : 4;
+      const max = recovery ? 10 : 8;
+
+      const format = () => {
+        const raw = input.value
+          .toUpperCase()
+          .replace(/[^A-Z0-9]/g, '')
+          .slice(0, max);
+        const groups = [];
+        for (let i = 0; i < raw.length; i += group) {
+          groups.push(raw.slice(i, i + group));
+        }
+        input.value = groups.join('-');
+      };
+
+      input.addEventListener('input', format);
+      input.addEventListener('blur', format);
+      input.addEventListener('paste', () => window.setTimeout(format, 0));
+      format();
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Full-page form submissions (consent, device approval, sign-out)
+  // -------------------------------------------------------------------------
+
+  function initSubmitBusy() {
+    document.querySelectorAll('form[method="post"]').forEach((form) => {
+      form.addEventListener('submit', (event) => {
+        // Do not disable the submitter: a disabled button is not included in
+        // the form data, which would drop the consent/device `decision` value.
+        const button =
+          event.submitter || form.querySelector('button[type="submit"]');
+        if (button) button.setAttribute('aria-busy', 'true');
+      });
+    });
+  }
+
   // -------------------------------------------------------------------------
   // Sign in
   // -------------------------------------------------------------------------
 
   function initLogin() {
+    const form = document.getElementById('login-form');
     const btn = document.getElementById('btn-login');
     const username = document.getElementById('username');
     let controller = null;
@@ -142,14 +276,15 @@
       location.href = res.next || '/';
     }
 
-    async function interactive() {
+    async function interactive(event) {
+      if (event) event.preventDefault();
       setMsg('');
       if (controller) {
         controller.abort();
         controller = null;
       }
       if (!passkeysSupported()) return;
-      btn.disabled = true;
+      setBusy(btn, true, '確認中…');
       try {
         const { publicKey } = await post('/api/webauthn/login/options', {
           rid: config.rid,
@@ -159,14 +294,15 @@
         });
         await finish(credential);
       } catch (err) {
-        btn.disabled = false;
+        setBusy(btn, false);
         setMsg(humanError(err));
       }
     }
 
     async function conditional() {
       if (!passkeysSupported()) return;
-      if (typeof PublicKeyCredential.isConditionalMediationAvailable !== 'function') return;
+      if (typeof PublicKeyCredential.isConditionalMediationAvailable !== 'function')
+        return;
       let available = false;
       try {
         available = await PublicKeyCredential.isConditionalMediationAvailable();
@@ -193,11 +329,11 @@
       }
     }
 
-    btn.addEventListener('click', interactive);
+    if (form) form.addEventListener('submit', interactive);
+    else if (btn) btn.addEventListener('click', interactive);
+
     if (username) {
-      username.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') interactive();
-      });
+      username.addEventListener('input', () => markInvalid(username, false));
     }
     if (passkeysSupported()) conditional();
   }
@@ -209,21 +345,37 @@
   function initSignup() {
     const form = document.getElementById('signup-form');
     const btn = document.getElementById('btn-signup');
+    if (!form) return;
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       setMsg('');
-      if (!passkeysSupported()) return;
 
-      const username = document.getElementById('username').value.trim();
-      const displayName = document.getElementById('display_name').value.trim();
-      const email = document.getElementById('email').value.trim();
-      if (username.length < 3) {
-        setMsg('ユーザー名は3文字以上で入力してください。');
+      const usernameEl = document.getElementById('username');
+      const displayEl = document.getElementById('display_name');
+      const emailEl = document.getElementById('email');
+      const username = usernameEl.value.trim();
+      const displayName = displayEl.value.trim();
+      const email = emailEl.value.trim();
+
+      markInvalid(usernameEl, false);
+      markInvalid(displayEl, false);
+
+      if (username.length < 3 || !/^[A-Za-z0-9._-]+$/.test(username)) {
+        markInvalid(usernameEl, true);
+        usernameEl.focus();
+        setMsg('ユーザー名は3〜64文字の英数字と . _ - で入力してください。');
         return;
       }
+      if (!displayName) {
+        markInvalid(displayEl, true);
+        displayEl.focus();
+        setMsg('表示名を入力してください。');
+        return;
+      }
+      if (!passkeysSupported()) return;
 
-      btn.disabled = true;
+      setBusy(btn, true, '作成中…');
       try {
         const start = await post('/api/webauthn/signup/options', {
           username,
@@ -240,7 +392,7 @@
         });
         location.href = res.next || '/';
       } catch (err) {
-        btn.disabled = false;
+        setBusy(btn, false);
         setMsg(humanError(err));
       }
     });
@@ -257,7 +409,7 @@
       btnAdd.addEventListener('click', async () => {
         setMsg('');
         if (!passkeysSupported()) return;
-        btnAdd.disabled = true;
+        setBusy(btnAdd, true, '追加中…');
         try {
           const start = await post('/api/webauthn/passkey/options', {});
           const credential = await navigator.credentials.create({
@@ -268,9 +420,9 @@
             credential: serializeCredential(credential),
           });
           setMsg('パスキーを追加しました。', true);
-          setTimeout(() => location.reload(), 700);
+          window.setTimeout(() => location.reload(), 700);
         } catch (err) {
-          btnAdd.disabled = false;
+          setBusy(btnAdd, false);
           setMsg(humanError(err));
         }
       });
@@ -285,16 +437,32 @@
         if (action === 'rename-passkey') {
           const next = window.prompt('パスキー名', el.dataset.name || 'パスキー');
           if (next === null) return;
-          await post('/api/account/passkey/rename', { id: el.dataset.id, name: next });
+          const name = next.trim();
+          if (!name) {
+            setMsg('パスキー名を入力してください。');
+            return;
+          }
+          setBusy(el, true, '保存中…');
+          await post('/api/account/passkey/rename', {
+            id: el.dataset.id,
+            name,
+          });
           setMsg('パスキー名を変更しました。', true);
-          setTimeout(() => location.reload(), 500);
+          window.setTimeout(() => location.reload(), 500);
         } else if (action === 'delete-passkey') {
-          if (!window.confirm('このパスキーを削除しますか？')) return;
+          if (
+            !window.confirm(
+              'このパスキーを削除しますか？削除すると、このパスキーではサインインできなくなります。'
+            )
+          )
+            return;
+          setBusy(el, true, '削除中…');
           await post('/api/account/passkey/delete', { id: el.dataset.id });
           setMsg('パスキーを削除しました。', true);
-          setTimeout(() => location.reload(), 500);
+          window.setTimeout(() => location.reload(), 500);
         } else if (action === 'revoke-session') {
           if (!window.confirm('このデバイスをサインアウトしますか？')) return;
+          setBusy(el, true, '処理中…');
           const res = await post('/api/account/sessions/revoke', {
             id: el.dataset.id,
           });
@@ -303,16 +471,18 @@
             return;
           }
           setMsg('デバイスをサインアウトしました。', true);
-          setTimeout(() => location.reload(), 500);
+          window.setTimeout(() => location.reload(), 500);
         } else if (action === 'revoke-consent') {
           if (!window.confirm('このアプリへのアクセスを取り消しますか？')) return;
+          setBusy(el, true, '処理中…');
           await post('/api/account/consent/revoke', {
             client_id: el.dataset.client,
           });
           setMsg('アクセスを取り消しました。', true);
-          setTimeout(() => location.reload(), 500);
+          window.setTimeout(() => location.reload(), 500);
         }
       } catch (err) {
+        setBusy(el, false);
         setMsg(humanError(err));
       }
     });
@@ -321,22 +491,28 @@
     if (profile) {
       profile.addEventListener('submit', async (event) => {
         event.preventDefault();
+        setMsg('');
         const button = profile.querySelector('button[type="submit"]');
-        if (button) button.disabled = true;
+        const nameEl = document.getElementById('profile-display-name');
+        const name = nameEl.value.trim();
+        if (!name) {
+          markInvalid(nameEl, true);
+          nameEl.focus();
+          setMsg('表示名を入力してください。');
+          return;
+        }
+        markInvalid(nameEl, false);
+        setBusy(button, true, '保存中…');
         try {
           await post('/api/account/profile', {
-            display_name: document
-              .getElementById('profile-display-name')
-              .value.trim(),
-            email:
-              document.getElementById('profile-email').value.trim() || null,
+            display_name: name,
+            email: document.getElementById('profile-email').value.trim() || null,
           });
           setMsg('プロフィールを保存しました。', true);
-          setTimeout(() => location.reload(), 500);
+          window.setTimeout(() => location.reload(), 500);
         } catch (err) {
+          setBusy(button, false);
           setMsg(humanError(err));
-        } finally {
-          if (button) button.disabled = false;
         }
       });
     }
@@ -345,13 +521,13 @@
     if (revokeOthers) {
       revokeOthers.addEventListener('click', async () => {
         if (!window.confirm('このデバイス以外をすべてサインアウトしますか？')) return;
-        revokeOthers.disabled = true;
+        setBusy(revokeOthers, true, '処理中…');
         try {
           const res = await post('/api/account/sessions/revoke-others', {});
           setMsg(`${res.revoked || 0} 台のデバイスをサインアウトしました。`, true);
-          setTimeout(() => location.reload(), 600);
+          window.setTimeout(() => location.reload(), 600);
         } catch (err) {
-          revokeOthers.disabled = false;
+          setBusy(revokeOthers, false);
           setMsg(humanError(err));
         }
       });
@@ -366,7 +542,7 @@
           )
         )
           return;
-        generate.disabled = true;
+        setBusy(generate, true, '生成中…');
         try {
           const res = await post('/api/account/recovery/generate', {});
           const list = document.getElementById('recovery-list');
@@ -382,7 +558,7 @@
         } catch (err) {
           setMsg(humanError(err));
         } finally {
-          generate.disabled = false;
+          setBusy(generate, false);
         }
       });
     }
@@ -393,11 +569,20 @@
         const codes = Array.from(
           document.querySelectorAll('#recovery-list li')
         ).map((li) => li.textContent);
+        if (!codes.length) {
+          setMsg('コピーするコードがありません。先に生成してください。');
+          return;
+        }
         try {
           await navigator.clipboard.writeText(codes.join('\n'));
-          setMsg('コピーしました。', true);
+          const original = copy.textContent;
+          copy.textContent = 'コピーしました';
+          setMsg('リカバリーコードをコピーしました。', true);
+          window.setTimeout(() => {
+            copy.textContent = original;
+          }, 1600);
         } catch (_) {
-          setMsg('コピーできませんでした。手動で選択してください。');
+          setMsg('コピーできませんでした。コードを選択して手動でコピーしてください。');
         }
       });
     }
@@ -406,16 +591,30 @@
     if (del) {
       del.addEventListener('submit', async (event) => {
         event.preventDefault();
-        const username = document
-          .getElementById('confirm-username')
-          .value.trim();
-        if (!username) return;
+        const input = document.getElementById('confirm-username');
+        const username = input.value.trim();
+        const button = del.querySelector('button[type="submit"]');
+        markInvalid(input, false);
+        if (!username) {
+          markInvalid(input, true);
+          input.focus();
+          setMsg('確認のためユーザー名を入力してください。');
+          return;
+        }
+        if (config.username && username !== config.username) {
+          markInvalid(input, true);
+          input.focus();
+          setMsg('入力されたユーザー名がアカウントと一致しません。');
+          return;
+        }
         if (!window.confirm('本当にアカウントを削除しますか？この操作は取り消せません。'))
           return;
+        setBusy(button, true, '削除中…');
         try {
           await post('/api/account/delete', { username });
           location.href = '/login';
         } catch (err) {
+          setBusy(button, false);
           setMsg(humanError(err));
         }
       });
@@ -432,22 +631,41 @@
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
       setMsg('');
+      const usernameEl = document.getElementById('recover-username');
+      const codeEl = document.getElementById('recover-code');
       const button = document.getElementById('btn-recover');
-      button.disabled = true;
+      const username = usernameEl.value.trim();
+      const code = codeEl.value.trim();
+      markInvalid(usernameEl, false);
+      markInvalid(codeEl, false);
+
+      if (!username) {
+        markInvalid(usernameEl, true);
+        usernameEl.focus();
+        setMsg('ユーザー名を入力してください。');
+        return;
+      }
+      if (code.replace(/[^A-Za-z0-9]/g, '').length < 8) {
+        markInvalid(codeEl, true);
+        codeEl.focus();
+        setMsg('リカバリーコードを確認してください。');
+        return;
+      }
+
+      setBusy(button, true, '確認中…');
       try {
         const res = await post('/api/recover', {
-          username: document.getElementById('recover-username').value.trim(),
-          code: document.getElementById('recover-code').value.trim(),
+          username,
+          code,
           rid: config.rid || null,
         });
         location.href = res.next || '/';
       } catch (err) {
-        button.disabled = false;
+        setBusy(button, false);
         setMsg(humanError(err));
       }
     });
   }
-
 
   // -------------------------------------------------------------------------
   // Demo relying party (uses the public SDK in /static/kagi.js)
@@ -502,6 +720,10 @@
 
     logoutBtn.addEventListener('click', () => sdk.logout());
   }
+
+  initTheme();
+  initCodeInputs();
+  initSubmitBusy();
 
   if (config.flow === 'login') initLogin();
   else if (config.flow === 'signup') initSignup();
