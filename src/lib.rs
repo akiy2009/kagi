@@ -238,6 +238,7 @@ fn routes_and_security(state: AppState) -> Router {
         .route("/demo/callback", get(demo_page))
         .route("/static/app.js", get(app_js))
         .route("/static/kagi.js", get(kagi_js))
+        .route("/static/theme.js", get(theme_js))
         .route("/static/style.css", get(style_css))
         .fallback(not_found)
         .with_state(state.clone())
@@ -594,6 +595,17 @@ async fn kagi_js() -> Response {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         include_str!("../static/kagi.js"),
+    )
+        .into_response()
+}
+
+async fn theme_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("../static/theme.js"),
     )
         .into_response()
 }
