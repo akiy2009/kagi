@@ -14,20 +14,28 @@ fn page(title: &str, body: &str) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<meta name="description" content="kagi — パスキーでサインインできる OIDC アイデンティティプロバイダー。">
+<meta name="theme-color" content='#ffffff' media="(prefers-color-scheme: light)">
+<meta name="theme-color" content='#0a0a0a' media="(prefers-color-scheme: dark)">
 <title>{title} · Kagi Identity</title>
 <link rel="stylesheet" href="/static/style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='7.5' cy='15.5' r='4.5' fill='none' stroke='black' stroke-width='2'/><path d='M10.7 12.3 21 2m-3 3 3 3m-6 0 2 2' fill='none' stroke='black' stroke-width='2'/></svg>">
+<script src="/static/theme.js"></script>
 </head>
 <body>
-<main class="shell">
+<a class="skip-link" href='#main'>本文へスキップ</a>
+<main class="shell" id="main" tabindex="-1">
 {body}
 </main>
+{theme}
 <script src="/static/app.js" defer></script>
 </body>
 </html>
 "#,
         title = esc(title),
-        body = body
+        body = body,
+        theme = theme_toggle()
     )
 }
 
@@ -51,6 +59,16 @@ fn brand() -> String {
     )
 }
 
+/// Theme switcher. The label is updated by `static/app.js`; the initial value
+/// is always "auto" and `static/theme.js` applies an explicit saved choice
+/// before the first paint.
+fn theme_toggle() -> &'static str {
+    r#"<button class="theme-toggle" id="theme-toggle" type="button" aria-label="テーマ: 自動" title="テーマ: 自動（クリックで切り替え）">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18Z" fill="currentColor" stroke="none"/></svg>
+<span class="theme-label">自動</span>
+</button>"#
+}
+
 pub fn error_page(code: &str, message: &str) -> String {
     page(
         "エラー",
@@ -60,7 +78,8 @@ pub fn error_page(code: &str, message: &str) -> String {
 <p class="eyebrow">Error {code}</p>
 <h1>処理できませんでした</h1>
 <p class="muted">{message}</p>
-<p class="foot"><a href="/">ホームに戻る</a></p>
+<p class="hint">問題が続く場合は、時間をおいてもう一度お試しください。</p>
+<p class="foot"><a href="/">ホームに戻る</a> ・ <a href="/login">サインイン</a></p>
 </section>"#,
             brand = brand(),
             code = esc(code),
@@ -80,17 +99,28 @@ pub fn login_page(rid: &str, csrf: &str) -> String {
         &format!(
             r#"<section class="card narrow">
 {brand}
+<p class="eyebrow">Sign in</p>
 <h1>パスキーでサインイン</h1>
 <p class="muted">生体認証・画面ロック・セキュリティキーで認証します。パスワードは保存されません。</p>
-<label class="field">
-  <span>ユーザー名</span>
-  <input id="username" name="username" autocomplete="username webauthn" placeholder="username" autofocus>
-</label>
-<button class="primary" id="btn-login" type="button">
-  <span class="label">パスキーで続行</span>
-</button>
+<form id="login-form">
+  <label class="field">
+    <span>ユーザー名 <em>任意</em></span>
+    <input id="username" name="username" autocomplete="username webauthn" placeholder="username" autofocus aria-describedby="username-hint">
+    <small class="field-hint" id="username-hint">この端末にパスキーが1つだけなら、空欄のままでも進めます。</small>
+  </label>
+  <button class="primary" id="btn-login" type="submit">
+    <span class="label">パスキーで続行</span>
+  </button>
+</form>
 <p class="msg" id="msg" role="status" aria-live="polite"></p>
-<p class="foot">アカウントをお持ちでない方は <a href="/signup{signup_q}">新規登録</a><br>パスキーが使えない場合は <a href="/recover{recover_q}">リカバリーコード</a></p>
+<details class="help">
+  <summary>パスキーが使えないとき</summary>
+  <div class="help-body">
+    <p>Chrome・Edge・Safari・Firefox の最新版と、HTTPS（または localhost）が必要です。</p>
+    <p>別の端末のパスキーを使う場合は、その端末でこのページを開いてください。保存済みの<a href="/recover{recover_q}">リカバリーコード</a>でもサインインできます。</p>
+  </div>
+</details>
+<p class="foot">アカウントをお持ちでない方は <a href="/signup{signup_q}">新規登録</a></p>
 {config}
 </section>"#,
             brand = brand(),
@@ -119,12 +149,14 @@ pub fn signup_page(rid: Option<&str>) -> String {
         &format!(
             r#"<section class="card narrow">
 {brand}
+<p class="eyebrow">Create account</p>
 <h1>パスキーで始める</h1>
 <p class="muted">アカウントはパスキーだけで保護されます。パスワードもメール認証も不要です。</p>
 <form id="signup-form" autocomplete="off">
   <label class="field">
     <span>ユーザー名</span>
-    <input id="username" name="username" autocomplete="username" placeholder="alice" required minlength="3" maxlength="64" pattern="[A-Za-z0-9._\-]+">
+    <input id="username" name="username" autocomplete="username" placeholder="alice" required minlength="3" maxlength="64" pattern="[A-Za-z0-9._\-]+" aria-describedby="username-hint">
+    <small class="field-hint" id="username-hint">3〜64文字。英数字と <code>._-</code> が使えます。</small>
   </label>
   <label class="field">
     <span>表示名</span>
@@ -132,7 +164,8 @@ pub fn signup_page(rid: Option<&str>) -> String {
   </label>
   <label class="field">
     <span>メールアドレス <em>任意</em></span>
-    <input id="email" name="email" type="email" autocomplete="email" placeholder="alice@example.com">
+    <input id="email" name="email" type="email" autocomplete="email" placeholder="alice@example.com" aria-describedby="email-hint">
+    <small class="field-hint" id="email-hint">OIDC の <code>email</code> スコープで共有されます。</small>
   </label>
   <button class="primary" id="btn-signup" type="submit">
     <span class="label">パスキーを作成</span>
@@ -192,12 +225,13 @@ pub fn consent_page(
 <h1>{client}</h1>
 <p class="muted"><strong>{user}</strong> としてサインイン中。次の情報へのアクセスを許可します。</p>
 <ul class="scopes">{scopes}</ul>
+<p class="callout">許可すると <strong>{client}</strong> は上記の情報を、解除するまで利用できます。許可したアプリはアカウント画面の「連携アプリ」からいつでも解除できます。</p>
 <p class="hint">リダイレクト先 <code>{host}</code></p>
-<form method="post" action="/consent" class="row">
+<form method="post" action="/consent" class="row choice">
   <input type="hidden" name="rid" value="{rid}">
   <input type="hidden" name="csrf" value="{csrf}">
-  <button class="ghost" type="submit" name="decision" value="deny">拒否</button>
   <button class="primary" type="submit" name="decision" value="allow"><span class="label">許可</span></button>
+  <button class="ghost" type="submit" name="decision" value="deny">拒否</button>
 </form>
 </section>"#,
             brand = brand(),
@@ -222,6 +256,11 @@ pub fn device_page(rid: &str, csrf: &str, prefill: &str, username: &str) -> Stri
 <p class="eyebrow">デバイス承認</p>
 <h1>デバイスを接続</h1>
 <p class="muted"><strong>{user}</strong> としてサインイン中。デバイスに表示されたコードを入力してください。</p>
+<ol class="steps">
+  <li>デバイスに表示されたコードを確認します。</li>
+  <li>下の欄に入力します。小文字でも自動で大文字になります。</li>
+  <li>内容を確認して「許可」を選びます。</li>
+</ol>
 <form method="post" action="/device" class="stack">
   <input type="hidden" name="rid" value="{rid}">
   <input type="hidden" name="csrf" value="{csrf}">
@@ -229,11 +268,13 @@ pub fn device_page(rid: &str, csrf: &str, prefill: &str, username: &str) -> Stri
     <span>デバイスコード</span>
     <input id="user_code" name="user_code" value="{prefill}" autocomplete="one-time-code"
       autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH" required
-      maxlength="24" autofocus>
+      maxlength="24" autofocus class="code-input" data-code-format="device"
+      aria-describedby="device-code-hint">
+    <small class="field-hint" id="device-code-hint">8文字のコードです。ハイフンは自動で入ります。</small>
   </label>
-  <div class="row">
-    <button class="ghost" type="submit" name="decision" value="deny">拒否</button>
+  <div class="row choice">
     <button class="primary" type="submit" name="decision" value="allow"><span class="label">許可</span></button>
+    <button class="ghost" type="submit" name="decision" value="deny">拒否</button>
   </div>
 </form>
 <p class="hint">心当たりのないコードは許可しないでください。コードは第三者に伝えないでください。</p>
@@ -555,6 +596,13 @@ pub fn account_page(
         .map(|c| c.to_uppercase().to_string())
         .unwrap_or_else(|| "?".to_string());
 
+    let consent_count = consents.len();
+    let recovery_stat = if recovery_enabled {
+        recovery_count.to_string()
+    } else {
+        "—".to_string()
+    };
+
     page(
         "アカウント",
         &format!(
@@ -567,16 +615,33 @@ pub fn account_page(
 
 <section class="account-head">
   <div class="avatar" aria-hidden="true">{initial}</div>
-  <div>
+  <div class="account-id">
     <h1>{name}</h1>
     <p class="muted">@{username} ・ {created} から利用</p>
   </div>
 </section>
 
+<div class="stat-strip" role="group" aria-label="アカウントの概要">
+  <div class="stat"><strong>{passkey_count}</strong><span>パスキー</span></div>
+  <div class="stat"><strong>{session_count}</strong><span>デバイス</span></div>
+  <div class="stat"><strong>{consent_count}</strong><span>連携アプリ</span></div>
+  <div class="stat"><strong>{recovery_stat}</strong><span>リカバリーコード</span></div>
+</div>
+
+<nav class="section-nav" aria-label="アカウント内のセクション">
+  <a href='#profile'>プロフィール</a>
+  <a href='#passkeys'>パスキー</a>
+  <a href='#sessions'>デバイス</a>
+  <a href='#apps'>連携アプリ</a>
+  <a href='#recovery'>リカバリー</a>
+  <a href='#activity'>イベント</a>
+  <a href='#delete'>削除</a>
+</nav>
+
 <p class="msg" id="msg" role="status" aria-live="polite"></p>
 
 <div class="grid">
-  <section class="panel">
+  <section class="panel" id="profile">
     <div class="panel-head"><h2>プロフィール</h2></div>
     <form id="profile-form" class="stack" autocomplete="off">
       <label class="field">
@@ -591,7 +656,7 @@ pub fn account_page(
     </form>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="passkeys">
     <div class="panel-head">
       <h2>パスキー</h2>
       <span class="count">{passkey_count}</span>
@@ -600,7 +665,7 @@ pub fn account_page(
     <button class="ghost small" id="btn-add-passkey" type="button">パスキーを追加</button>
   </section>
 
-  <section class="panel wide">
+  <section class="panel wide" id="sessions">
     <div class="panel-head">
       <h2>サインイン中のデバイス</h2>
       <span class="count">{session_count}</span>
@@ -609,22 +674,22 @@ pub fn account_page(
     <button class="ghost small" id="btn-revoke-others" type="button">他のデバイスをすべてサインアウト</button>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="apps">
     <div class="panel-head"><h2>連携アプリ</h2></div>
     <ul class="list">{consent_items}</ul>
   </section>
 
-  <section class="panel">
+  <section class="panel" id="recovery">
     <div class="panel-head"><h2>リカバリーコード</h2></div>
     {recovery}
   </section>
 
-  <section class="panel wide">
+  <section class="panel wide" id="activity">
     <div class="panel-head"><h2>最近のセキュリティイベント</h2></div>
     <ul class="timeline">{event_items}</ul>
   </section>
 
-  <section class="panel wide danger-zone">
+  <section class="panel wide danger-zone" id="delete">
     <div class="panel-head"><h2>アカウント削除</h2></div>
     <p class="muted small">アカウントを削除すると、パスキー・セッション・連携情報がすべて削除されます。この操作は取り消せません。</p>
     <form id="delete-form" autocomplete="off">
@@ -647,7 +712,9 @@ pub fn account_page(
             passkeys = passkeys,
             session_count = sessions.len(),
             session_items = session_items,
+            consent_count = consent_count,
             consent_items = consent_items,
+            recovery_stat = esc(&recovery_stat),
             recovery = recovery,
             event_items = event_items,
             config = config,
@@ -666,7 +733,7 @@ pub fn recover_page(rid: Option<&str>) -> String {
         &format!(
             r#"<section class="card narrow">
 {brand}
-<p class="eyebrow">リカバリー</p>
+<p class="eyebrow">Recovery</p>
 <h1>コードでサインイン</h1>
 <p class="muted">パスキーが使えないとき、保存しておいたリカバリーコードでサインインできます。コードは一度だけ使えます。</p>
 <form id="recover-form" autocomplete="off">
@@ -676,12 +743,15 @@ pub fn recover_page(rid: Option<&str>) -> String {
   </label>
   <label class="field">
     <span>リカバリーコード</span>
-    <input id="recover-code" name="code" autocomplete="one-time-code" placeholder="ABCDE-FGHJK" required>
+    <input id="recover-code" name="code" autocomplete="one-time-code" placeholder="ABCDE-FGHJK"
+      autocapitalize="characters" spellcheck="false" required class="code-input"
+      data-code-format="recovery" aria-describedby="recover-code-hint">
+    <small class="field-hint" id="recover-code-hint">10文字のコードです。小文字でも自動で大文字になります。</small>
   </label>
   <button class="primary" id="btn-recover" type="submit"><span class="label">サインイン</span></button>
 </form>
 <p class="msg" id="msg" role="status" aria-live="polite"></p>
-<p class="foot"><a href="/login">パスキーでサインイン</a></p>
+<p class="foot"><a href="/login">パスキーでサインイン</a> ・ <a href="/">アカウントに戻る</a></p>
 {config}
 </section>"#,
             brand = brand(),
@@ -756,17 +826,26 @@ pub fn demo_page(issuer: &str, seeded: bool) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<meta name="description" content="kagi — パスキーでサインインできる OIDC アイデンティティプロバイダー。">
+<meta name="theme-color" content='#ffffff' media="(prefers-color-scheme: light)">
+<meta name="theme-color" content='#0a0a0a' media="(prefers-color-scheme: dark)">
 <title>デモ · kagi</title>
 <link rel="stylesheet" href="/static/style.css">
+<script src="/static/theme.js"></script>
 </head>
 <body>
-<main class="shell">
+<a class="skip-link" href='#main'>本文へスキップ</a>
+<main class="shell" id="main" tabindex="-1">
 {body}
 </main>
+{theme}
 <script src="/static/kagi.js?v=2"></script>
 <script src="/static/app.js" defer></script>
 </body>
 </html>
-"#
+"#,
+        body = body,
+        theme = theme_toggle()
     )
 }
